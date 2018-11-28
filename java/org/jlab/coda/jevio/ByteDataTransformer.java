@@ -181,7 +181,8 @@ public class ByteDataTransformer {
 
     /**
      * Converts an ByteBuffer object into a byte array.
-     * Copy is made of the data.
+     * Copy is made of the data. Does change the position
+     * of the byteBuffer arg temporarily.
      *
      * @param byteBuffer the buffer to convert.
      * @return the ByteBuffer converted into a byte array.
@@ -191,14 +192,9 @@ public class ByteDataTransformer {
         int size = byteBuffer.remaining();
         byte array[] = new byte[size];
 
-        // Avoid potential disaster if byteBuffer is a slice.
-        // In that case, it's backing array can be bigger than its capacity
-        // with no way to tell what the proper offset is. In this case do NOT
-        // do the arraycopy.
-
-        if (byteBuffer.hasArray() && (byteBuffer.array().length == byteBuffer.capacity())) {
-            System.arraycopy(byteBuffer.array(), byteBuffer.position(),
-                             array, 0, byteBuffer.remaining());
+        if (byteBuffer.hasArray()) {
+            System.arraycopy(byteBuffer.array(), byteBuffer.arrayOffset(),
+                             array, 0, size);
         }
         else {
             int pos = byteBuffer.position();
@@ -212,12 +208,26 @@ public class ByteDataTransformer {
 
     /**
      * Converts an ByteBuffer object into an int array.
+     * If length not a multiple of 4 bytes, ignore up to last 3 bytes.
      *
      * @param byteBuffer the buffer to convert.
-     * @return the ByteBuffer converted into an int array.
+     * @return the int array containing byteBuffer's data.
      */
     public static int[] toIntArray(ByteBuffer byteBuffer) {
         if (byteBuffer == null) return null;
+
+        if (byteBuffer.hasArray()) {
+            byte[] backingArray = byteBuffer.array();
+            int backingArrayOffset = byteBuffer.arrayOffset();
+            int len = byteBuffer.remaining()/4;
+            int[] array = new int[len];
+            try {
+                toIntArray(backingArray, backingArrayOffset, byteBuffer.remaining(),
+                           byteBuffer.order(), array, 0);
+            }
+            catch (EvioException e) {/* never happen */}
+            return array;
+        }
 
         IntBuffer ibuf = byteBuffer.asIntBuffer();
 
@@ -225,6 +235,42 @@ public class ByteDataTransformer {
         int array[] = new int[size];
         ibuf.get(array, 0, size);
         return array;
+    }
+
+
+    /**
+     * Writes ByteBuffer data into an int array.
+     * Provide the int array to avoid its allocation.
+     * If length not a multiple of 4 bytes, ignore up to last 3 bytes.
+     *
+     * @param byteBuffer the buffer to convert.
+     * @param dest array in which to put buffer data.
+     * @return number of integers in the dest array filled with valid data.
+     * @throws EvioException if bad args or dest cannot hold all of byteBuffer's data
+     *                       (from position to limit).
+     */
+    public static int toIntArray(ByteBuffer byteBuffer, int[] dest) throws EvioException {
+        if (byteBuffer == null || dest == null ||
+            byteBuffer.remaining() > 4*dest.length) {
+            throw new EvioException("bad arg(s)");
+        }
+
+        int len = byteBuffer.remaining()/4;
+
+        if (byteBuffer.hasArray()) {
+            byte[] backingArray = byteBuffer.array();
+            int backingArrayOffset = byteBuffer.arrayOffset();
+            try {
+                toIntArray(backingArray, backingArrayOffset,
+                           byteBuffer.order(), dest, 0);
+            }
+            catch (EvioException e) {/* never happen */}
+            return len;
+        }
+
+        IntBuffer ibuf = byteBuffer.asIntBuffer();
+        ibuf.get(dest, 0, len);
+        return len;
     }
 
 
@@ -312,6 +358,47 @@ public class ByteDataTransformer {
         return BaseStructure.unpackRawBytesToStrings(byteBuffer,
                                                      byteBuffer.position(),
                                                      byteBuffer.limit() - byteBuffer.position());
+    }
+
+
+    // ==============================
+    // primitive type --> ByteBuffer
+    // ==============================
+
+    /**
+     * Write int array into ByteBuffer.
+     *
+     * @param data       int data to write
+     * @param dataOffset offset into data array
+     * @param dataLen    number of ints to write
+     * @param buffer     buffer in which to write data
+     * @throws EvioException if data is null, buffer is null or too small, or offset out of bounds;
+     */
+    public static void intoByteBuffer(int[] data, int dataOffset, int dataLen, ByteBuffer buffer)
+            throws EvioException{
+
+        if (data == null || dataOffset < 0 || dataOffset >= data.length ||
+            buffer == null || dataLen < 0 || dataLen > (data.length - dataOffset) ||
+            4*dataLen > (buffer.capacity() - buffer.position())) {
+
+            throw new EvioException("bad arg(s)");
+        }
+
+
+        if (buffer.hasArray()) {
+            // Does not change buffer position or limit
+            toBytes(data, dataOffset, dataLen, buffer.order(), buffer.array(),
+                   buffer.arrayOffset() + buffer.position());
+
+            buffer.limit(buffer.position() + 4*dataLen);
+            return;
+        }
+
+        IntBuffer ib = buffer.asIntBuffer();
+        ib.put(data, dataOffset, dataLen);
+        buffer.limit(buffer.position() + 4*dataLen);
+
+        return;
     }
 
 
@@ -518,6 +605,50 @@ public class ByteDataTransformer {
             dest[off+1] = (byte)(data >>  8);
             dest[off+2] = (byte)(data >> 16);
             dest[off+3] = (byte)(data >> 24);
+        }
+    }
+
+
+    /**
+     * Write int array into byte array.
+     * Avoids creation of new byte array with each call.
+     *
+     * @param data      int data to convert
+     * @param dataOff   offset into data array
+     * @param dataLen   number of ints to write
+     * @param byteOrder byte order of returned bytes (big endian if null)
+     * @param dest      array in which to store returned bytes
+     * @param off       offset into dest array where returned bytes are placed
+     * @throws EvioException if data/dest are null or bad offset values
+     */
+    public static void toBytes(int[] data, int dataOff, int dataLen,
+                               ByteOrder byteOrder, byte[] dest, int off)
+            throws EvioException {
+
+        if (data == null || dataOff < 0 || dataOff > data.length - 1 ||
+            dataLen < 0 || dataLen > (data.length - dataOff) ||
+            dest == null || (dest.length - off) < 4*dataLen || off < 0) {
+
+            throw new EvioException("bad arg(s)");
+        }
+
+        int index;
+        boolean bigEndian = (byteOrder == null) || (byteOrder == ByteOrder.BIG_ENDIAN);
+
+        for (int i=dataOff; i < dataOff + dataLen; i++) {
+            index = 4*(i - dataOff);
+            if (bigEndian) {
+                dest[index + off  ] = (byte)(data[i] >> 24);
+                dest[index + off+1] = (byte)(data[i] >> 16);
+                dest[index + off+2] = (byte)(data[i] >>  8);
+                dest[index + off+3] = (byte)(data[i]      );
+            }
+            else {
+                dest[index + off  ] = (byte)(data[i]      );
+                dest[index + off+1] = (byte)(data[i] >>  8);
+                dest[index + off+2] = (byte)(data[i] >> 16);
+                dest[index + off+3] = (byte)(data[i] >> 24);
+            }
         }
     }
 
@@ -1077,7 +1208,7 @@ public class ByteDataTransformer {
      */
     public static short[] toShortArray(byte[] data, int padding, ByteOrder byteOrder) throws EvioException {
         if (data == null || data.length % 2 != 0 || (padding != 0 && padding != 2)) {
-            throw new EvioException("bad data arg");
+            throw new EvioException("bad arg");
         }
 
         short[] sa = new short[(data.length - padding)/2];
@@ -1104,12 +1235,12 @@ public class ByteDataTransformer {
             throws EvioException {
 
         if (data == null || data.length % 2 != 0 || (padding != 0 && padding != 2) ||
-            dest == null || 2*dest.length < data.length-padding+off || off < 0) {
-            throw new EvioException("bad data arg");
+            dest == null || 2*(dest.length - off) < data.length-padding || off < 0) {
+            throw new EvioException("bad arg");
         }
 
         //int len = data.length - padding;
-System.out.println("toShortArray: padding = " + padding + ", data len = " + data.length);
+//System.out.println("toShortArray: padding = " + padding + ", data len = " + data.length);
         for (int i = 0; i < data.length - padding - 1; i+=2) {
             dest[i/2+off] = toShort(data[i],
                                     data[i+1],
@@ -1130,8 +1261,8 @@ System.out.println("toShortArray: padding = " + padding + ", data len = " + data
             throws EvioException {
 
         if (data == null || data.length % 2 != 0 ||
-            dest == null || 2*dest.length < data.length+off || off < 0) {
-            throw new EvioException("bad data arg");
+            dest == null || 2*(dest.length - off) < data.length || off < 0) {
+            throw new EvioException("bad arg");
         }
 
         for (int i = 0; i < data.length-1; i+=2) {
@@ -1141,7 +1272,7 @@ System.out.println("toShortArray: padding = " + padding + ", data len = " + data
         }
     }
 
-	    // =========================
+	// =========================
 
     /**
      * Turn section of byte array into an int.
@@ -1234,6 +1365,9 @@ System.out.println("toShortArray: padding = " + padding + ", data len = " + data
 
     /**
      * Turn byte array into an int array.
+     * The data array length must be a multiple of 4.
+     * Number of int array elements = number of bytes / 4.
+     * The dest array must be large enough to contain the data.
      *
      * @param data byte array to convert
      * @param byteOrder byte order of supplied bytes (big endian if null)
@@ -1245,8 +1379,8 @@ System.out.println("toShortArray: padding = " + padding + ", data len = " + data
             throws EvioException {
 
         if (data == null || data.length % 4 != 0 ||
-            dest == null || 4*dest.length < data.length+off || off < 0) {
-            throw new EvioException("bad data arg");
+            dest == null || 4*(dest.length - off) < data.length || off < 0) {
+            throw new EvioException("bad arg");
         }
 
         for (int i = 0; i < data.length-3; i+=4) {
@@ -1255,6 +1389,77 @@ System.out.println("toShortArray: padding = " + padding + ", data len = " + data
                                   data[i+2],
                                   data[i+3],
                                   byteOrder);
+        }
+    }
+
+    /**
+     * Turn byte array into an int array.
+     * Unlike the other methods, the data array length
+     * does not have to be a multiple of 4.
+     * Number of int array elements = number of bytes / 4.
+     * The dest array must be large enough to contain the data.
+     *
+     * @param data       byte array to convert
+     * @param dataOffset offset into data array
+     * @param byteOrder  byte order of supplied bytes (big endian if null)
+     * @param dest       array in which to write converted bytes
+     * @param destOffset offset into dest array
+     * @throws EvioException if data is null; dest is null, wrong size, or off < 0
+     */
+    public static void toIntArray(byte[] data, int dataOffset,
+                                   ByteOrder byteOrder, int[] dest, int destOffset)
+            throws EvioException {
+
+        if (data == null ||
+            dataOffset < 0 || dataOffset > data.length - 1 || dest == null ||
+            4*(dest.length - destOffset) < (data.length - dataOffset) ||
+            destOffset < 0) {
+            throw new EvioException("bad arg");
+        }
+
+        for (int i = 0; i < data.length-3; i+=4) {
+            dest[i/4+destOffset] = toInt(data[i   + dataOffset],
+                                         data[i+1 + dataOffset],
+                                         data[i+2 + dataOffset],
+                                         data[i+3 + dataOffset],
+                                         byteOrder);
+        }
+    }
+
+    /**
+     * Turn byte array into an int array.
+     * Unlike the other methods, the data array length
+     * does not have to be a multiple of 4.
+     * Number of int array elements = number of bytes / 4.
+     * The dest array must be large enough to contain the data.
+     *
+     * @param data       byte array to convert.
+     * @param dataOffset offset into data array.
+     * @param dataLen    number of bytes to convert.
+     * @param byteOrder  byte order of supplied bytes (big endian if null).
+     * @param dest       array in which to write converted bytes.
+     * @param destOffset offset into dest array.
+     * @throws EvioException if data is null; dest is null, wrong size, or off < 0
+     */
+    public static void toIntArray(byte[] data, int dataOffset, int dataLen,
+                                   ByteOrder byteOrder, int[] dest, int destOffset)
+            throws EvioException {
+
+        if (data == null ||
+            dataOffset < 0 || dataOffset > data.length - 1 ||
+            dataLen < 0 || dataLen > (data.length - dataOffset) ||
+            dest == null ||
+            4*(dest.length - destOffset) < dataLen ||
+            destOffset < 0) {
+            throw new EvioException("bad arg");
+        }
+
+        for (int i = 0; i < dataLen-3; i+=4) {
+            dest[i/4+destOffset] = toInt(data[i   + dataOffset],
+                                         data[i+1 + dataOffset],
+                                         data[i+2 + dataOffset],
+                                         data[i+3 + dataOffset],
+                                         byteOrder);
         }
     }
 
@@ -1391,8 +1596,8 @@ System.out.println("toShortArray: padding = " + padding + ", data len = " + data
             throws EvioException {
 
         if (data == null || data.length % 8 != 0 ||
-            dest == null || 8*dest.length < data.length+off || off < 0) {
-            throw new EvioException("bad data arg");
+            dest == null || 8*(dest.length - off) < data.length || off < 0) {
+            throw new EvioException("bad arg");
         }
 
         for (int i = 0; i < data.length-7; i+=8) {
@@ -1478,8 +1683,8 @@ System.out.println("toShortArray: padding = " + padding + ", data len = " + data
             throws EvioException {
 
         if (data == null || data.length % 4 != 0 ||
-            dest == null || 4*dest.length < data.length+off || off < 0) {
-            throw new EvioException("bad data arg");
+            dest == null || 4*(dest.length - off) < data.length || off < 0) {
+            throw new EvioException("bad arg");
         }
 
         for (int i = 0; i < data.length-3; i+=4) {
@@ -1569,8 +1774,8 @@ System.out.println("toShortArray: padding = " + padding + ", data len = " + data
             throws EvioException {
 
         if (data == null || data.length % 8 != 0 ||
-            dest == null || 8*dest.length < data.length+off || off < 0) {
-            throw new EvioException("bad data arg");
+            dest == null || 8*(dest.length - off) < data.length || off < 0) {
+            throw new EvioException("bad arg");
         }
 
         for (int i = 0; i < data.length-7; i+=8) {
@@ -1598,6 +1803,7 @@ System.out.println("toShortArray: padding = " + padding + ", data len = " + data
      * of the the source buffer argument. If the swap is done in place, the
      * byte order of the source buffer will be switched upon completion and
      * the destPos arg will be set equal to the srcPos arg.
+     * The positions of the source and destination buffers are not changed.
      * A ByteBuffer's current byte order can be found by calling
      * {@link java.nio.ByteBuffer#order()}.<p>
      *
@@ -1627,6 +1833,7 @@ System.out.println("toShortArray: padding = " + padding + ", data len = " + data
      * of the the source buffer argument. If the swap is done in place, the
      * byte order of the source buffer will be switched upon completion and
      * the destPos arg will be set equal to the srcPos arg.
+     * The positions of the source and destination buffers are not changed.
      * A ByteBuffer's current byte order can be found by calling
      * {@link java.nio.ByteBuffer#order()}.<p>
      *
@@ -1659,6 +1866,7 @@ System.out.println("toShortArray: padding = " + padding + ", data len = " + data
      * of the the source buffer argument. If the swap is done in place, the
      * byte order of the source buffer will be switched upon completion and
      * the destPos arg will be set equal to the srcPos arg.
+     * The positions of the source and destination buffers are not changed.
      * A ByteBuffer's current byte order can be found by calling
      * {@link java.nio.ByteBuffer#order()}.<p>
      *
@@ -1729,8 +1937,8 @@ System.out.println("toShortArray: padding = " + padding + ", data len = " + data
 //System.out.println("Created top node containing " + node.getDataTypeObj());
 
         // The event is an evio bank so recursively swap it as such
-        swapStructure(node.getDataTypeObj(), srcBuffer, destBuffer,
-                      srcPos + 8, destPos + 8, node.dataLen, inPlace, swapData, nodeList);
+        swapStructure(node, srcBuffer, destBuffer,
+                      srcPos + 8, destPos + 8, inPlace, swapData, nodeList);
 
         if (inPlace) {
             srcBuffer.order(destOrder);
@@ -1758,74 +1966,34 @@ System.out.println("toShortArray: padding = " + padding + ", data len = " + data
                 throws EvioException {
 
         try {
-            int dt, type, pad, tag, num, length;
-            ByteOrder srcOrder = srcBuffer.order();
-
-            if (node != null) node.pos = destPos;
-
             // Read & swap first bank header word
-            length = srcBuffer.getInt(srcPos);
+            int length = srcBuffer.getInt(srcPos);
             destBuffer.putInt(destPos, length);
             srcPos  += 4;
             destPos += 4;
-//System.out.println("  BH: len = " + length);
 
-            // Read second bank header word
-            if (srcOrder == ByteOrder.BIG_ENDIAN) {
-                tag = srcBuffer.getShort(srcPos) & 0x0000ffff;
-                srcPos += 2;
+            // Read & swap second bank header word
+            int word = srcBuffer.getInt(srcPos);
+            destBuffer.putInt(destPos, word);
 
-                dt = srcBuffer.get(srcPos++) & 0x000000ff;
-                type = dt & 0x3f;
-                pad  = dt >>> 6;
-                // If only 7th bit set, that can only be the legacy tagsegment type
-                // with no padding information - convert it properly.
-                if (dt == 0x40) {
-                    type = DataType.TAGSEGMENT.getValue();
-                    pad = 0;
-                }
+            // node is never null
+            node.tag = word >>> 16;
 
-                num = srcBuffer.get(srcPos++) & 0x000000ff;
-            }
-            else {
-                num = srcBuffer.get(srcPos++) & 0x000000ff;
-
-                dt = srcBuffer.get(srcPos++) & 0x000000ff;
-                type = dt & 0x3f;
-                pad  = dt >>> 6;
-                if (dt == 0x40) {
-                    type = DataType.TAGSEGMENT.getValue();
-                    pad = 0;
-                }
-
-                tag = srcBuffer.getShort(srcPos) & 0x0000ffff;
-                srcPos += 2;
-            }
-//System.out.println("  BH: type/tag/num/pad = " + type + "/" + tag + "/" + num + "/" + pad);
-
-            // Swap second bank header word
-            if (srcOrder == ByteOrder.BIG_ENDIAN) {
-                destBuffer.put(destPos++, (byte)num);
-                destBuffer.put(destPos++, (byte)dt);
-                destBuffer.putShort(destPos, (short)tag);
-                destPos += 2;
-            }
-            else {
-                destBuffer.putShort(destPos, (short)tag);
-                destPos += 2;
-                destBuffer.put(destPos++, (byte)dt);
-                destBuffer.put(destPos++, (byte)num);
+            int dt = (word >>> 8) & 0xff;
+            node.dataType = dt & 0x3f;
+            node.pad = dt >>> 6;
+            // If only 7th bit set, that can only be the legacy tagsegment type
+            // with no padding information - convert it properly.
+            if (dt == 0x40) {
+                node.dataType = DataType.TAGSEGMENT.getValue();
+                node.pad = 0;
             }
 
-            if (node != null) {
-                node.len = length;
-                node.num = num;
-                node.tag = tag;
-                node.pad = pad;
-                node.dataPos = destPos;
-                node.dataLen = length - 1;
-                node.dataType = type;
-            }
+            node.num     = word & 0xff;
+            node.len     = length;
+            node.pos     = destPos - 4;
+            node.dataPos = destPos + 4;
+            node.dataLen = length - 1;
         }
         catch (BufferOverflowException e) {
             throw new EvioException("destBuffer too small to hold swapped data");
@@ -1856,66 +2024,28 @@ System.out.println("toShortArray: padding = " + padding + ", data len = " + data
                 throws EvioException {
 
         try {
-            int dt, type, pad, tag, len;
-            ByteOrder srcOrder = srcBuffer.order();
+            // Read & swap segment header word
+            int word = srcBuffer.getInt(srcPos);
+            destBuffer.putInt(destPos, word);
 
-            if (node != null) node.pos = destPos;
+            // node is never null
+            node.tag = word >>> 24;
 
-            // Read segment header word
-            if (srcOrder == ByteOrder.BIG_ENDIAN) {
-                tag = srcBuffer.get(srcPos++) & 0x000000ff;
-                dt  = srcBuffer.get(srcPos++) & 0x000000ff;
-                type = dt & 0x3f;
-                pad  = dt >>> 6;
-                // If only 7th bit set, that can only be the legacy tagsegment type
-                // with no padding information - convert it properly.
-                if (dt == 0x40) {
-                    type = DataType.TAGSEGMENT.getValue();
-                    pad = 0;
-                }
-
-                len = srcBuffer.getShort(srcPos) & 0x0000ffff;
-                srcPos += 2;
-            }
-            else {
-                len = srcBuffer.getShort(srcPos) & 0x0000ffff;
-                srcPos += 2;
-
-                dt = srcBuffer.get(srcPos++) & 0x000000ff;
-                type = dt & 0x3f;
-                pad  = dt >>> 6;
-                if (dt == 0x40) {
-                    type = DataType.TAGSEGMENT.getValue();
-                    pad = 0;
-                }
-
-                tag = srcBuffer.get(srcPos++) & 0x000000ff;
-            }
-//System.out.println("found tag/num = " + tag + ", " + num);
-
-            // Swap segment header word
-            if (srcOrder == ByteOrder.BIG_ENDIAN) {
-                destBuffer.putShort(destPos, (short)len);
-                destPos += 2;
-                destBuffer.put(destPos++, (byte)dt);
-                destBuffer.put(destPos++, (byte)tag);
-            }
-            else {
-                destBuffer.put(destPos++, (byte)tag);
-                destBuffer.put(destPos++, (byte)((type & 0x3f) | (pad << 6)));
-                destBuffer.putShort(destPos, (short)len);
-                destPos += 2;
+            int dt = (word >>> 16) & 0xff;
+            node.dataType = dt & 0x3f;
+            node.pad = dt >>> 6;
+            // If only 7th bit set, that can only be the legacy tagsegment type
+            // with no padding information - convert it properly.
+            if (dt == 0x40) {
+                node.dataType = DataType.TAGSEGMENT.getValue();
+                node.pad = 0;
             }
 
-            if (node != null) {
-                node.len = len;
-                node.num = 0;
-                node.tag = tag;
-                node.pad = pad;
-                node.dataPos = destPos;
-                node.dataLen = len;
-                node.dataType = type;
-            }
+            node.len     = word & 0xffff;
+            node.num     = 0;
+            node.pos     = destPos;
+            node.dataPos = destPos + 4;
+            node.dataLen = node.len;
         }
         catch (BufferOverflowException e) {
             throw new EvioException("destBuffer too small to hold swapped data");
@@ -1946,57 +2076,19 @@ System.out.println("toShortArray: padding = " + padding + ", data len = " + data
                 throws EvioException {
 
         try {
-            int type, tag, len, temp;
-            ByteOrder srcOrder = srcBuffer.order();
+            // Read & swap tagsegment header word
+            int word = srcBuffer.getInt(srcPos);
+            destBuffer.putInt(destPos, word);
 
-            if (node != null) node.pos = destPos;
-
-            // Read segment header word
-            if (srcOrder == ByteOrder.BIG_ENDIAN) {
-                temp = srcBuffer.getShort(srcPos) & 0x0000ffff;
-                srcPos += 2;
-
-                tag  = temp >>> 4;
-                type = temp & 0xf;
-
-                len = srcBuffer.getShort(srcPos) & 0x0000ffff;
-                srcPos += 2;
-            }
-            else {
-                len = srcBuffer.getShort(srcPos) & 0x0000ffff;
-                srcPos += 2;
-
-                temp = srcBuffer.getShort(srcPos) & 0x0000ffff;
-                srcPos += 2;
-
-                tag  = temp >>> 4;
-                type = temp & 0xf;
-            }
-//System.out.println("found tag/num = " + tag + ", " + num);
-
-            // Swap segment header word
-            if (srcOrder == ByteOrder.BIG_ENDIAN) {
-                destBuffer.putShort(destPos, (short)len);
-                destPos += 2;
-                destBuffer.putShort(destPos, (short)temp);
-                destPos += 2;
-            }
-            else {
-                destBuffer.putShort(destPos, (short)temp);
-                destPos += 2;
-                destBuffer.putShort(destPos, (short)len);
-                destPos += 2;
-            }
-
-            if (node != null) {
-                node.len = len;
-                node.num = 0;
-                node.tag = tag;
-                node.pad = 0;
-                node.dataPos = destPos;
-                node.dataLen = len;
-                node.dataType = type;
-            }
+            // node is never null
+            node.tag      = word >>> 20;
+            node.dataType = (word >>> 16) & 0xf;
+            node.len      = word & 0xffff;
+            node.num      = 0;
+            node.pad      = 0;
+            node.pos      = destPos;
+            node.dataPos  = destPos + 4;
+            node.dataLen  = node.len;
         }
         catch (BufferOverflowException e) {
             throw new EvioException("destBuffer too small to hold swapped data");
@@ -2063,7 +2155,8 @@ System.out.println("toShortArray: padding = " + padding + ", data len = " + data
 				break;
 
             // 8 bit swap - no swap needed, but need to copy if destBuf != srcBuf
-			case CHAR8:
+            case UNKNOWN32:
+            case CHAR8:
 			case UCHAR8:
             case CHARSTAR8:
                 if (!inPlace) {
@@ -2087,13 +2180,11 @@ System.out.println("toShortArray: padding = " + padding + ", data len = " + data
      * Swap an evio structure. If it is a structure of structures,
      * such as a bank of banks, swap recursively.
      *
-     * @param dataType   the type of evio data contained in structure to swap
-     *                   (bank, segment, double, int, ...).
+     * @param node       info from parsed header
      * @param srcBuffer  buffer containing structure to swap.
      * @param destBuffer buffer in which to place the swapped structure.
      * @param srcPos     position in srcBuffer to start reading structure
      * @param destPos    position in destBuffer to start writing swapped structure
-     * @param length     length of structure in 32-bit words
      * @param inPlace    if true, data is swapped in srcBuffer
      * @param swapData   if false, data is NOT swapped, else it is
      * @param nodeList   if not null, store all node objects here -
@@ -2104,11 +2195,16 @@ System.out.println("toShortArray: padding = " + padding + ", data len = " + data
      *                       if destBuffer too small;
      *                       if bad values for srcPos and/or destPos;
      */
-    static void swapStructure(DataType dataType, ByteBuffer srcBuffer,
+    static void swapStructure(EvioNode node, ByteBuffer srcBuffer,
                               ByteBuffer destBuffer, int srcPos, int destPos,
-                              int length, boolean inPlace, boolean swapData,
+                              boolean inPlace, boolean swapData,
                               List<EvioNode> nodeList)
              throws EvioException {
+
+        // Pass in header info through node object.
+        // Reuse this node object if not storing in a list of all nodes.
+        DataType dataType = node.getDataTypeObj();
+        int length = node.dataLen;
 
         // If not a structure of structures, swap the data and return - no more recursion.
         if (!dataType.isStructure()) {
@@ -2119,13 +2215,11 @@ System.out.println("toShortArray: padding = " + padding + ", data len = " + data
         }
 
         int offset = 0, sPos = srcPos, dPos = destPos;
-        EvioNode node = new EvioNode();
 
         EvioNode firstNode = null;
         if (nodeList != null) {
             firstNode = nodeList.get(0);
-            node.scanned   = true;
-            node.eventNode = firstNode;
+            node = new EvioNode(firstNode);
         }
 
         // change 32-bit words to bytes
@@ -2137,15 +2231,15 @@ System.out.println("toShortArray: padding = " + padding + ", data len = " + data
             case ALSOBANK:
                 // Swap all banks contained in this structure
                 while (offset < length) {
-//System.out.println("bank A: offset = " + offset + ", len = " + length);
                     swapBankHeader(node, srcBuffer, destBuffer, sPos, dPos);
-//System.out.println("Create bank node for struct holding " + node.getDataTypeObj());
-
-                    swapStructure(node.getDataTypeObj(), srcBuffer, destBuffer,
-                                  sPos+8, dPos+8, node.dataLen, inPlace, swapData, nodeList);
 
                     // Position offset to start of next header
                     offset += 4 * (node.len + 1); // plus 1 for length word
+
+                    // Recursive call, reuse node object if not storing
+                    swapStructure(node, srcBuffer, destBuffer,
+                                  sPos+8, dPos+8, inPlace, swapData, nodeList);
+
                     sPos = srcPos  + offset;
                     dPos = destPos + offset;
 
@@ -2154,12 +2248,9 @@ System.out.println("toShortArray: padding = " + padding + ", data len = " + data
                         node.type = DataType.BANK.getValue();
                         nodeList.add(node);
                         if (offset < length) {
-                            node = new EvioNode();
-                            node.scanned   = true;
-                            node.eventNode = firstNode;
+                            node = new EvioNode(firstNode);
                         }
                     }
-//System.out.println("bank B: offset = " + offset + ", len = " + length);
                 }
                 break;
 
@@ -2167,14 +2258,13 @@ System.out.println("toShortArray: padding = " + padding + ", data len = " + data
             case ALSOSEGMENT:
                 // extract all the segments from this bank.
                 while (offset < length) {
-//System.out.println("seg A: offset = " + offset + ", len = " + length);
                     swapSegmentHeader(node, srcBuffer, destBuffer, sPos, dPos);
 
-//System.out.println("Create seg node for struct holding " + node.getDataTypeObj());
-                    swapStructure(node.getDataTypeObj(), srcBuffer, destBuffer,
-                                  sPos+4, dPos+4, node.dataLen, inPlace, swapData, nodeList);
-
                     offset += 4 * (node.len + 1);
+
+                    swapStructure(node, srcBuffer, destBuffer,
+                                  sPos+4, dPos+4, inPlace, swapData, nodeList);
+
                     sPos = srcPos  + offset;
                     dPos = destPos + offset;
 
@@ -2183,12 +2273,9 @@ System.out.println("toShortArray: padding = " + padding + ", data len = " + data
                         node.type = DataType.SEGMENT.getValue();
                         nodeList.add(node);
                         if (offset < length) {
-                            node = new EvioNode();
-                            node.scanned   = true;
-                            node.eventNode = firstNode;
+                            node = new EvioNode(firstNode);
                         }
                     }
-//System.out.println("seg B: offset = " + offset + ", len = " + length);
                 }
 
                 break;
@@ -2197,15 +2284,14 @@ System.out.println("toShortArray: padding = " + padding + ", data len = " + data
          // case ALSOTAGSEGMENT:
                 // extract all the tag segments from this bank.
                 while (offset < length) {
-//System.out.println("tagseg A: offset = " + offset + ", len = " + length);
 
                     swapTagSegmentHeader(node, srcBuffer, destBuffer, sPos, dPos);
-//System.out.println("Create tagseg node for struct holding " + node.getDataTypeObj());
-
-                    swapStructure(node.getDataTypeObj(), srcBuffer, destBuffer,
-                                  sPos+4, dPos+4, node.dataLen, inPlace, swapData, nodeList);
 
                     offset += 4 * (node.len + 1);
+
+                    swapStructure(node, srcBuffer, destBuffer,
+                                  sPos+4, dPos+4, inPlace, swapData, nodeList);
+
                     sPos = srcPos  + offset;
                     dPos = destPos + offset;
 
@@ -2213,12 +2299,9 @@ System.out.println("toShortArray: padding = " + padding + ", data len = " + data
                         node.type = DataType.TAGSEGMENT.getValue();
                         nodeList.add(node);
                         if (offset < length) {
-                            node = new EvioNode();
-                            node.scanned   = true;
-                            node.eventNode = firstNode;
+                            node = new EvioNode(firstNode);
                         }
                     }
-//System.out.println("tagseg B: offset = " + offset + ", len = " + length);
                 }
 
                 break;

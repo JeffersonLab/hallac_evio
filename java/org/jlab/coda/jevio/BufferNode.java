@@ -18,13 +18,6 @@ public final class BufferNode {
     /** Blocks contained in the buffer. */
     ArrayList<BlockNode> blockNodes;
 
-    /**
-     * If top-level event node, was I scanned and all my blocks
-     * already placed into lists?
-     */
-    boolean scanned;
-
-
     //----------------------------------
     // Constructor (package accessible)
     //----------------------------------
@@ -35,7 +28,7 @@ public final class BufferNode {
      */
     BufferNode(ByteBuffer buffer) {
         this.buffer = buffer;
-        blockNodes = new ArrayList<BlockNode>(1000);
+        blockNodes = new ArrayList<>(10);
     }
 
     //-------------------------------
@@ -47,7 +40,7 @@ public final class BufferNode {
     }
 
     //-------------------------------
-    // Getters
+    // Getters & Setters
     //-------------------------------
 
     /**
@@ -58,5 +51,10 @@ public final class BufferNode {
         return buffer;
     }
 
+    /**
+     * set the byte buffer.
+     * @param buf new byte buffer.
+     */
+    void setBuffer(ByteBuffer buf) { buffer = buf; }
 
 }

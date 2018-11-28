@@ -6,7 +6,7 @@
     <property environment="env"/>
     
     <!-- Version -->
-    <property name="evio.version" value="4.4.6" />
+    <property name="evio.version" value="5.2" />
     
     <!-- Debug -->
     <property name="javac.debug" value="on" />
@@ -96,6 +96,19 @@
     <!-- ************************************************************* -->
 
 
+    <!-- if $CODA is set, use that for classpath -->
+    <target name="CODA_cp" depends="installCheck" if="codaDefined">
+        <path id="classpath">
+            <fileset dir="${env.CODA}/common/jar" >
+                <include name="*.jar" />
+            </fileset>
+        </path>
+        <echo message="Compile with jars in $CODA/common/jar" />
+    </target>
+
+
+    <!-- ************************************************************* -->
+
     <!-- Prepare things by creating directories -->
     <target name="prepare" depends="installCheck" >
         <mkdir dir="${build.dir}" />
@@ -129,7 +142,7 @@
     </target>
     
     <!-- Compile all source -->
-    <target name="compile" depends="prepare" description="Compiles all source code.">
+    <target name="compile" depends="CODA_cp,prepare" description="Compiles all source code.">
         <javac destdir="${build.classes}" debug="${javac.debug}" optimize="yes" >
             <src path="${src.dir}" />
             <classpath refid="classpath" />

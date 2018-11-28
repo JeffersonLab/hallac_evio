@@ -12,15 +12,17 @@
  *   Carl Timmer, Jan 2012, evio version 4
  *   Merged src/libsrc/xml_util.c with this file.
  *   This takes all xml formatting stuff out of evio library.
+ *
+ *   Sergei Boiarinov added composite data handling
  */
 
 
 
 /* container types used locally */
 enum {
-  BANK = 0,
-  SEGMENT,
-  TAGSEGMENT,
+    BANK = 0,
+    SEGMENT,
+    TAGSEGMENT,
 };
 
 /* for posix */
@@ -29,13 +31,13 @@ enum {
 
 
 /*  misc macros, etc. */
-#define MAXXMLBUF  10000
+#define MAXXMLBUF  100000
 #define MAXDICT    5000
 #define MAXDEPTH   512
 #define min(a, b)  ( ( (a) > (b) ) ? (b) : (a) )
 
 
-#define MAXEVIOBUF   1000000
+#define MAXEVIOBUF   10000000
 #define EVIO2XML     5
 
 
@@ -44,8 +46,8 @@ enum {
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
-#include <evio.h>
 #include <expat.h>
+#include "evio.h"
 
 
 /*  misc variables from orig evio2xml.c */
@@ -77,7 +79,7 @@ static int done           = 0;
 
 /* xml tag dictionary */
 static XML_Parser dictParser;
-static char xmlbuf[MAXXMLBUF];
+static char *xmlbuf;
 typedef struct {
     char *name;
     int ntag;
@@ -98,14 +100,8 @@ int fragment_offset[] = {2,1,1};
 static int xtod         = 0;
 static int n8           = 8;
 static int n16          = 8;
-static int n32          = 5;
+static int n32          = 4;
 static int n64          = 2;
-static int w8           = 4;
-static int w16          = 9;
-static int w32          = 14;
-static int p32          = 6;
-static int w64          = 28;
-static int p64          = 20;
 
 
 /*  misc variables */
@@ -121,10 +117,53 @@ static int no_typename    = 0;
 static int verbose        = 0;
 static int brief          = 0;
 static int no_data        = 0;
-static int nindent        = 0;
-static int indent_size    = 3;
+
+
+/*********** XML INDENTATION ********************/
 static char *xml;
-static int xmllen;
+
+static char indentStr[3*MAXDEPTH + 1];
+
+static void indent() {
+    xml += sprintf(xml, indentStr);
+}
+
+static int getIndent() {
+    return (int)strlen(indentStr);
+}
+
+/** Routine to increase the xml indentation by 3 spaces up to the limit. */
+static void increaseIndent() {
+    int i, len = strlen(indentStr);
+    if (len > 3*MAXDEPTH) return;
+
+    for (i=len-1; i<len+3; i++) {
+        indentStr[i] = ' ';
+    }
+    indentStr[len+3] = '\0';
+}
+
+/** Routine to decrease the xml indentation by 3 spaces down to 0. */
+static void decreaseIndent() {
+    int i, len = strlen(indentStr);
+    if (len < 3) return;
+    indentStr[len-3] = '\0';
+}
+
+/** Routine to increase the indentation by 3 spaces up to the limit
+ *  and then add the indentation to the xml string being created. */
+static void increaseAndIndent() {
+    increaseIndent();
+    indent();
+}
+
+/** Routine to decrease the indentation by 3 spaces down to 0
+ *  and then add the indentation to the xml string being created. */
+static void decreaseAndIndent() {
+    decreaseIndent();
+    indent();
+}
+/************************************************/
 
 
 /* xml_util.c prototypes */
@@ -133,13 +172,16 @@ static void startDictElement(void *userData, const char *name, const char **atts
 static void dump_fragment(unsigned int *buf, int fragment_type);
 static void dump_data(unsigned int *data, int type, int length, int padding, int noexpand);
 static int  get_ndata(int type, int nwords, int padding);
-static void indent(int extra);
 static const char *get_matchname();
 static const char *get_char_att(const char **atts, const int natt, const char *tag);
 
 /* user supplied fragment select function via set_user_frag_select_func(int (*f) (int tag)) */
 static int (*USER_FRAG_SELECT_FUNC) (int tag) = NULL;
 
+/* From C lib */
+extern int eviofmtdump(int *iarr, int nwrd, unsigned char *ifmt, int nfmt,
+                int nextrabytes, int numIndent, int hex, char *xmlStringx);
+extern int eviofmt(char *fmt, unsigned char *ifmt, int ifmtLen);
 
 /* evio2xml.c prototypes */
 void decode_command_line(int argc, char **argv);
@@ -162,12 +204,7 @@ int set_n8(int val);
 int set_n16(int val);
 int set_n32(int val);
 int set_n64(int val);
-int set_w8(int val);
-int set_w16(int val);
-int set_w32(int val);
-int set_w64(int val);
 int set_xtod(int val);
-int set_indent_size(int val);
 int set_max_depth(int val);
 int set_no_typename(int val);
 int set_verbose(int val);
@@ -178,300 +215,100 @@ int set_no_data(int val);
 /*--------------------------------------------------------------------------*/
 
 
-int main (int argc, char **argv) {
+int main (int argc, char **argv)
+{
 
-  int handle,status;
-  FILE *out = NULL;
-  char s[256];
-  
-
-  /* decode command line */
-  decode_command_line(argc,argv);
+    int handle, status;
+    FILE *out = NULL;
+    char s[256];
 
 
-  /* allocate binary buffer and string buffer (EVIO2XML times as large) */
-  unsigned int *buf = (unsigned int*)malloc(maxbuf*sizeof(unsigned int));
-  char *xml = malloc(maxbuf*sizeof(unsigned int)*EVIO2XML);
-  if((buf==NULL)||(xml==NULL)) {
-    int sz=maxbuf*sizeof(unsigned int);
-    printf("\n   *** Unable to allocate buffers ***\n\n");
-    printf("\n buf size=%d bytes, addr=0x%p     xml size=%d bytes, addr=0x%p\n\n",sz,buf,
-           sz*EVIO2XML,xml);
-    exit(EXIT_FAILURE);
-  }
+    /* decode command line */
+    decode_command_line(argc,argv);
 
+    /*allocate xml buffer*/
+    xmlbuf = malloc(MAXXMLBUF);
 
-  /* open evio input file */
-  if((status=evOpen(filename,"r",&handle))!=0) {
-    printf("\n ?Unable to open file %s, status=%d\n\n",filename,status);
-    exit(EXIT_FAILURE);
-  }
+    /* allocate binary buffer and string buffer (EVIO2XML times as large) */
+    unsigned int *buf = (unsigned int*)malloc(maxbuf*sizeof(unsigned int));
+    char *xml = malloc(maxbuf*sizeof(unsigned int)*EVIO2XML);
 
-
-  /* open output file, gzip format if requested */
-  if(outfilename!=NULL) {
-    if(gzip==0) {
-      out=fopen(outfilename,"w");
-#ifndef _MSC_VER
-    } else {
-      out=(FILE*)gzopen(outfilename,"wb");
-#endif
-    }  
-  }
-  
-
-  /* init xmldump */
-  set_user_frag_select_func(user_frag_select);
-  evio_xmldump_init(dictfilename,dicttagname);
-  sprintf(s,"<!-- xml boilerplate needs to go here -->\n\n");
-  writeit(out,s,strlen(s));
-  sprintf(s,"<%s>\n\n",main_tag);
-  writeit(out,s,strlen(s));
-
-
-  /* loop over events, perhaps skip some, dump up to max_event events */
-  nevent=0;
-  while ((status=evRead(handle,buf,maxbuf))==0) {
-    nevent++;
-    if(skip_event>=nevent)continue;
-    if(user_event_select(buf)==0)continue;
-    xml[0]='\0';              /* clear xml string buffer */
-    evio_xmldump(buf,nevent,xml,maxbuf*sizeof(unsigned int)*EVIO2XML);
-    writeit(out,xml,strlen(xml));
-
-
-    if(pause!=0) {
-      printf("\n\nHit return to continue, q to quit: ");
-      fgets(s,sizeof(s),stdin);
-      if(tolower(s[strspn(s," \t")])=='q')done=1;
+    if((buf==NULL)||(xml==NULL)) {
+        int sz = (int)(maxbuf*sizeof(unsigned int));
+        printf("\n   *** Unable to allocate buffers ***\n\n");
+        printf("\n buf size=%d bytes, addr=0x%p     xml size=%d bytes, addr=0x%p\n\n",sz, (void *)buf,
+               sz*EVIO2XML, (void *)xml);
+        exit(EXIT_FAILURE);
     }
 
-    if((done!=0)||((nevent>=max_event+skip_event)&&(max_event!=0)))break;
-  }
-  if(status!=EOF)printf("\n   *** error reading file, status is: 0x%x ***\n\n",status);;
+
+    /* Initialize indent string */
+    indentStr[0] = '\0';
 
 
+    /* open evio input file */
+    if((status=evOpen(filename,"r",&handle))!=0) {
+        printf("\n ?Unable to open file %s, status=%d, 0x%x\n\n",filename,status, status);
+        exit(EXIT_FAILURE);
+    }
 
-  /* done */
-  evio_xmldump_done(xml,maxbuf*sizeof(unsigned int)*EVIO2XML);
-  writeit(out,xml,strlen(xml));
-  sprintf(s,"</%s>\n\n",main_tag);
-  writeit(out,s,strlen(s));
-  evClose(handle);
+
+    /* open output file, gzip format if requested */
+    if(outfilename!=NULL) {
+        if(gzip==0) {
+            out=fopen(outfilename,"w");
 #ifndef _MSC_VER
-  if((out!=NULL)&&(gzip!=0))gzclose(out);
+        } else {
+            out=(FILE*)gzopen(outfilename,"wb");
 #endif
-  exit(EXIT_SUCCESS);
-}
-
-
-/*---------------------------------------------------------------- */
-
-/*---------------------------------------------------------------- */
-/*--- Set functions ---------------------------------------------- */
-/*---------------------------------------------------------------- */
-
-
-int set_event_tag(char *tag) {
-    
-    event_tag=tag;
-    return(0);
-}
-
-
-/*---------------------------------------------------------------- */
-
-
-int set_bank2_tag(char *tag) {
-    
-    bank2_tag=tag;
-    return(0);
-    
-}
-
-
-/*---------------------------------------------------------------- */
-
-
-int set_n8(int val) {
-    
-    n8=val;
-    return(0);
-    
-}
-
-
-/*---------------------------------------------------------------- */
-
-
-int set_n16(int val) {
-    
-    n16=val;
-    return(0);
-    
-}
-
-
-/*---------------------------------------------------------------- */
-
-
-int set_n32(int val) {
-    
-    n32=val;
-    return(0);
-    
-}
-
-
-/*---------------------------------------------------------------- */
-
-
-int set_n64(int val) {
-    
-    n64=val;
-    return(0);
-    
-}
-
-
-/*---------------------------------------------------------------- */
-
-int set_w8(int val) {
-    
-    w8=val;
-    return(0);
-    
-}
-
-
-/*---------------------------------------------------------------- */
-
-
-int set_w16(int val) {
-    
-    w16=val;
-    return(0);
-    
-}
-
-
-/*---------------------------------------------------------------- */
-
-
-int set_w32(int val) {
-    
-    w32=val;
-    return(0);
-    
-}
-
-
-/*---------------------------------------------------------------- */
-
-
-int set_p32(int val) {
-    
-    p32=val;
-    return(0);
-    
-}
-
-
-/*---------------------------------------------------------------- */
-
-
-int set_w64(int val) {
-    
-    w64=val;
-    return(0);
-    
-}
-
-
-/*---------------------------------------------------------------- */
-
-
-int set_p64(int val) {
-    
-    p64=val;
-    return(0);
-    
-}
-
-
-/*---------------------------------------------------------------- */
-
-
-int set_xtod(int val) {
-    
-    xtod=val;
-    return(0);
-    
-}
-
-
-/*---------------------------------------------------------------- */
-
-
-int set_indent_size(int val) {
-    
-    indent_size=val;
-    return(0);
-    
-}
-
-
-/*---------------------------------------------------------------- */
-
-
-int set_max_depth(int val) {
-    
-    max_depth=val;
-    return(0);
-    
-}
-
-
-/*---------------------------------------------------------------- */
-
-
-int set_no_typename(int val) {
-    
-    no_typename=val;
-    return(0);
-    
-}
-
-
-/*---------------------------------------------------------------- */
-
-
-int set_verbose(int val) {
-    
-    verbose=val;
-    return(0);
-    
-}
-
-
-/*---------------------------------------------------------------- */
-
-
-int set_brief(int val) {
-    
-    brief=val;
-    return(0);
-    
-}
-
-
-/*---------------------------------------------------------------- */
-
-int set_no_data(int val) {
-    
-    no_data=val;
-    return(0);
-    
+        }
+    }
+
+
+    /* init xmldump */
+    set_user_frag_select_func(user_frag_select);
+    evio_xmldump_init(dictfilename,dicttagname);
+    sprintf(s,"<?xml version=\"1.0\"?>\n");
+    writeit(out,s,strlen(s));
+    sprintf(s,"<%s>\n",main_tag);
+    writeit(out,s,strlen(s));
+
+    increaseIndent();
+
+    /* loop over events, perhaps skip some, dump up to max_event events */
+    nevent=0;
+    while ((status=evRead(handle,buf,maxbuf))==0) {
+        nevent++;
+        if(skip_event>=nevent){printf("cont1\n");continue;}
+        if(user_event_select(buf)==0){printf("cont2\n");continue;}
+        xml[0]='\0';              /* clear xml string buffer */
+        evio_xmldump(buf,nevent,xml,maxbuf*sizeof(unsigned int)*EVIO2XML);
+        writeit(out,xml,strlen(xml));
+
+
+        if(pause!=0) {
+            printf("\n\nHit return to continue, q to quit: ");
+            fgets(s,sizeof(s),stdin);
+            if(tolower(s[strspn(s," \t")])=='q')done=1;
+        }
+
+        if((done!=0)||((nevent>=max_event+skip_event)&&(max_event!=0))){printf("break1\n");break;}
+    }
+    decreaseIndent();
+
+    if(status!=EOF) printf("\n   *** error reading file, status is: 0x%x ***\n\n",status);
+
+    /* done */
+    evio_xmldump_done(xml,maxbuf*sizeof(unsigned int)*EVIO2XML);
+    writeit(out,xml,strlen(xml));
+
+    sprintf(s,"</%s>\n\n",main_tag);
+    writeit(out,s,strlen(s));
+    evClose(handle);
+#ifndef _MSC_VER
+    if((out!=NULL)&&(gzip!=0))gzclose(out);
+#endif
+    exit(EXIT_SUCCESS);
 }
 
 
@@ -480,15 +317,15 @@ int set_no_data(int val) {
 
 void writeit(FILE *f, char *s, int len) {
 
-  if(f==NULL) {
-    printf("%s",s);
-  } else if (gzip==0) {
-    fprintf(f,s,len);
+    if(f==NULL) {
+        printf("%s",s);
+    } else if (gzip==0) {
+        fprintf(f,s,len);
 #ifndef _MSC_VER
-  } else {
-    gzwrite(f,s,len);
+    } else {
+        gzwrite(f,s,len);
 #endif
-  }
+    }
 
 }
 
@@ -498,21 +335,21 @@ void writeit(FILE *f, char *s, int len) {
 
 int user_event_select(unsigned int *buf) {
 
-  int i;
-  int event_tag = buf[1]>>16;
+    int i;
+    int event_tag = buf[1]>>16;
 
 
-  if((nevok<=0)&&(nnoev<=0)) {
-    return(1);
+    if((nevok<=0)&&(nnoev<=0)) {
+        return(1);
 
-  } else if(nevok>0) {
-    for(i=0; i<nevok; i++) if(event_tag==evok[i])return(1);
-    return(0);
-    
-  } else {
-    for(i=0; i<nnoev; i++) if(event_tag==noev[i])return(0);
-    return(1);
-  }
+    } else if(nevok>0) {
+        for(i=0; i<nevok; i++) if(event_tag==evok[i])return(1);
+        return(0);
+
+    } else {
+        for(i=0; i<nnoev; i++) if(event_tag==noev[i])return(0);
+        return(1);
+    }
 
 }
 
@@ -522,19 +359,19 @@ int user_event_select(unsigned int *buf) {
 
 int user_frag_select(int tag) {
 
-  int i;
+    int i;
 
-  if((nfragok<=0)&&(nnofrag<=0)) {
-    return(1);
+    if((nfragok<=0)&&(nnofrag<=0)) {
+        return(1);
 
-  } else if(nfragok>0) {
-    for(i=0; i<nfragok; i++) if(tag==fragok[i])return(1);
-    return(0);
-    
-  } else {
-    for(i=0; i<nnofrag; i++) if(tag==nofrag[i])return(0);
-    return(1);
-  }
+    } else if(nfragok>0) {
+        for(i=0; i<nfragok; i++) if(tag==fragok[i])return(1);
+        return(0);
+
+    } else {
+        for(i=0; i<nnofrag; i++) if(tag==nofrag[i])return(0);
+        return(1);
+    }
 
 }
 
@@ -543,192 +380,162 @@ int user_frag_select(int tag) {
 
 
 void decode_command_line(int argc, char**argv) {
-  
-  const char *help = 
-    "\nusage:\n\n  evio2xml [-max max_event] [-pause] [-skip skip_event]\n"
-    "           [-dict dictfilename] [-dtag dtag]\n"
-    "           [-ev evtag] [-noev evtag] [-frag frag] [-nofrag frag] [-max_depth max_depth]\n"
-    "           [-n8 n8] [-n16 n16] [-n32 n32] [-n64 n64]\n"
-    "           [-w8 w8] [-w16 w16] [-w32 w32] [-w64 w64]\n"
-    "           [-p32 p32] [-p64 p64]\n"
-    "           [-verbose] [-brief] [-no_data] [-xtod] [-m main_tag] [-e event_tag]\n"
-    "           [-indent indent_size] [-no_typename] [-maxbuf maxbuf] [-debug]\n"
-    "           [-out outfilenema] [-gz] filename\n";
-  int i;
-    
-    
-  if(argc<2) {
-    printf("%s\n",help);
-    exit(EXIT_SUCCESS);
-  } 
+
+    const char *help =
+            "\nusage:\n\n  evio2xml [-max max_event] [-pause] [-skip skip_event]\n"
+                    "           [-dict dictfilename] [-dtag dtag]\n"
+                    "           [-ev evtag] [-noev evtag] [-frag frag] [-nofrag frag] [-max_depth max_depth]\n"
+                    "           [-n8 n8] [-n16 n16] [-n32 n32] [-n64 n64]\n"
+                    "           [-verbose] [-brief] [-no_data] [-xtod] [-m main_tag] [-e event_tag]\n"
+                    "           [-indent indent_size] [-no_typename] [-maxbuf maxbuf] [-debug]\n"
+                    "           [-out outfilenema] [-gz] filename\n";
+    int i;
 
 
-  /* loop over arguments */
-  i=1;
-  while (i<argc) {
-    if (strncasecmp(argv[i],"-h",2)==0) {
-      printf("%s\n",help);
-      exit(EXIT_SUCCESS);
+    if(argc<2) {
+        printf("%s\n",help);
+        exit(EXIT_SUCCESS);
+    }
 
-    } else if (strncasecmp(argv[i],"-pause",6)==0) {
-      pause=1;
-      i=i+1;
 
-    } else if (strncasecmp(argv[i],"-out",4)==0) {
-      outfilename=strdup(argv[i+1]);
-      i=i+2;
+    /* loop over arguments */
+    i=1;
+    while (i<argc) {
+        if (strncasecmp(argv[i],"-h",2)==0) {
+            printf("%s\n",help);
+            exit(EXIT_SUCCESS);
 
-    } else if (strncasecmp(argv[i],"-maxbuf",7)==0) {
-      maxbuf=atoi(argv[i+1]);
-      i=i+2;
+        } else if (strncasecmp(argv[i],"-pause",6)==0) {
+            pause=1;
+            i=i+1;
 
-    } else if (strncasecmp(argv[i],"-debug",6)==0) {
-      debug=1;
-      i=i+1;
+        } else if (strncasecmp(argv[i],"-out",4)==0) {
+            outfilename=strdup(argv[i+1]);
+            i=i+2;
+
+        } else if (strncasecmp(argv[i],"-maxbuf",7)==0) {
+            maxbuf=atoi(argv[i+1]);
+            i=i+2;
+
+        } else if (strncasecmp(argv[i],"-debug",6)==0) {
+            debug=1;
+            i=i+1;
 
 #ifndef _MSC_VER
-    } else if (strncasecmp(argv[i],"-gz",3)==0) {
-      gzip=1;
-      i=i+1;
+        } else if (strncasecmp(argv[i],"-gz",3)==0) {
+            gzip=1;
+            i=i+1;
 #endif
 
-    } else if (strncasecmp(argv[i],"-verbose",8)==0) {
-      set_verbose(1);
-      i=i+1;
+        } else if (strncasecmp(argv[i],"-verbose",8)==0) {
+            set_verbose(1);
+            i=i+1;
 
-    } else if (strncasecmp(argv[i],"-brief",6)==0) {
-      set_brief(1);
-      i=i+1;
+        } else if (strncasecmp(argv[i],"-brief",6)==0) {
+            set_brief(1);
+            i=i+1;
 
-    } else if (strncasecmp(argv[i],"-no_data",8)==0) {
-      set_no_data(1);
-      i=i+1;
+        } else if (strncasecmp(argv[i],"-no_data",8)==0) {
+            set_no_data(1);
+            i=i+1;
 
-    } else if (strncasecmp(argv[i],"-no_typename",12)==0) {
-      set_no_typename(1);
-      i=i+1;
+        } else if (strncasecmp(argv[i],"-no_typename",12)==0) {
+            set_no_typename(1);
+            i=i+1;
 
-    } else if (strncasecmp(argv[i],"-max_depth",10)==0) {
-      set_max_depth(atoi(argv[i+1]));
-      i=i+2;
+        } else if (strncasecmp(argv[i],"-max_depth",10)==0) {
+            set_max_depth(atoi(argv[i+1]));
+            i=i+2;
 
-    } else if (strncasecmp(argv[i],"-indent",7)==0) {
-      set_indent_size(atoi(argv[i+1]));
-      i=i+2;
+        } else if (strncasecmp(argv[i],"-max",4)==0) {
+            max_event=atoi(argv[i+1]);
+            i=i+2;
 
-    } else if (strncasecmp(argv[i],"-max",4)==0) {
-      max_event=atoi(argv[i+1]);
-      i=i+2;
+        } else if (strncasecmp(argv[i],"-skip",5)==0) {
+            skip_event=atoi(argv[i+1]);
+            i=i+2;
 
-    } else if (strncasecmp(argv[i],"-skip",5)==0) {
-      skip_event=atoi(argv[i+1]);
-      i=i+2;
+        } else if (strncasecmp(argv[i],"-dict",5)==0) {
+            dictfilename=strdup(argv[i+1]);
+            i=i+2;
 
-    } else if (strncasecmp(argv[i],"-dict",5)==0) {
-      dictfilename=strdup(argv[i+1]);
-      i=i+2;
+        } else if (strncasecmp(argv[i],"-dtag",5)==0) {
+            dicttagname=strdup(argv[i+1]);
+            i=i+2;
 
-    } else if (strncasecmp(argv[i],"-dtag",5)==0) {
-      dicttagname=strdup(argv[i+1]);
-      i=i+2;
+        } else if (strncasecmp(argv[i],"-xtod",5)==0) {
+            set_xtod(1);
+            i=i+1;
 
-    } else if (strncasecmp(argv[i],"-xtod",5)==0) {
-      set_xtod(1);
-      i=i+1;
+        } else if (strncasecmp(argv[i],"-ev",3)==0) {
+            if(nevok<(sizeof(evok)/sizeof(int))) {
+                evok[nevok++]=atoi(argv[i+1]);
+                i=i+2;
+            } else {
+                printf("?too many ev flags: %s\n",argv[i+1]);
+            }
 
-    } else if (strncasecmp(argv[i],"-ev",3)==0) {
-      if(nevok<(sizeof(evok)/sizeof(int))) {
-	evok[nevok++]=atoi(argv[i+1]);
-	i=i+2;
-      } else {
-	printf("?too many ev flags: %s\n",argv[i+1]);
-      }
+        } else if (strncasecmp(argv[i],"-noev",5)==0) {
+            if(nnoev<(sizeof(noev)/sizeof(int))) {
+                noev[nnoev++]=atoi(argv[i+1]);
+                i=i+2;
+            } else {
+                printf("?too many noev flags: %s\n",argv[i+1]);
+            }
 
-    } else if (strncasecmp(argv[i],"-noev",5)==0) {
-      if(nnoev<(sizeof(noev)/sizeof(int))) {
-	noev[nnoev++]=atoi(argv[i+1]);
-	i=i+2;
-      } else {
-	printf("?too many noev flags: %s\n",argv[i+1]);
-      }
+        } else if (strncasecmp(argv[i],"-frag",5)==0) {
+            if(nfragok<(sizeof(fragok)/sizeof(int))) {
+                fragok[nfragok++]=atoi(argv[i+1]);
+                i=i+2;
+            } else {
+                printf("?too many frag flags: %s\n",argv[i+1]);
+            }
 
-    } else if (strncasecmp(argv[i],"-frag",5)==0) {
-      if(nfragok<(sizeof(fragok)/sizeof(int))) {
-	fragok[nfragok++]=atoi(argv[i+1]);
-	i=i+2;
-      } else {
-	printf("?too many frag flags: %s\n",argv[i+1]);
-      }
+        } else if (strncasecmp(argv[i],"-nofrag",7)==0) {
+            if(nnofrag<(sizeof(nofrag)/sizeof(int))) {
+                nofrag[nnofrag++]=atoi(argv[i+1]);
+                i=i+2;
+            } else {
+                printf("?too many nofrag flags: %s\n",argv[i+1]);
+            }
 
-    } else if (strncasecmp(argv[i],"-nofrag",7)==0) {
-      if(nnofrag<(sizeof(nofrag)/sizeof(int))) {
-	nofrag[nnofrag++]=atoi(argv[i+1]);
-	i=i+2;
-      } else {
-	printf("?too many nofrag flags: %s\n",argv[i+1]);
-      }
+        } else if (strncasecmp(argv[i],"-n8",3)==0) {
+            set_n8(atoi(argv[i+1]));
+            i=i+2;
 
-    } else if (strncasecmp(argv[i],"-n8",3)==0) {
-      set_n8(atoi(argv[i+1]));
-      i=i+2;
+        } else if (strncasecmp(argv[i],"-n16",4)==0) {
+            set_n16(atoi(argv[i+1]));
+            i=i+2;
 
-    } else if (strncasecmp(argv[i],"-n16",4)==0) {
-      set_n16(atoi(argv[i+1]));
-      i=i+2;
+        } else if (strncasecmp(argv[i],"-n32",4)==0) {
+            set_n32(atoi(argv[i+1]));
+            i=i+2;
 
-    } else if (strncasecmp(argv[i],"-n32",4)==0) {
-      set_n32(atoi(argv[i+1]));
-      i=i+2;
+        } else if (strncasecmp(argv[i],"-n64",4)==0) {
+            set_n64(atoi(argv[i+1]));
+            i=i+2;
 
-    } else if (strncasecmp(argv[i],"-n64",4)==0) {
-      set_n64(atoi(argv[i+1]));
-      i=i+2;
+        } else if (strncasecmp(argv[i],"-m",2)==0) {
+            main_tag=argv[i+1];
+            i=i+2;
 
-    } else if (strncasecmp(argv[i],"-w8",3)==0) {
-      set_w8(atoi(argv[i+1]));
-      i=i+2;
+        } else if (strncasecmp(argv[i],"-e",2)==0) {
+            set_event_tag(strdup(argv[i+1]));
+            i=i+2;
 
-    } else if (strncasecmp(argv[i],"-w16",4)==0) {
-      set_w16(atoi(argv[i+1]));
-      i=i+2;
+        } else if (strncasecmp(argv[i],"-",1)==0) {
+            printf("\n  ?unknown command line arg: %s\n\n",argv[i]);
+            exit(EXIT_FAILURE);
 
-    } else if (strncasecmp(argv[i],"-w32",4)==0) {
-      set_w32(atoi(argv[i+1]));
-      i=i+2;
-
-    } else if (strncasecmp(argv[i],"-p32",4)==0) {
-      set_p32(atoi(argv[i+1]));
-      i=i+2;
-
-    } else if (strncasecmp(argv[i],"-w64",4)==0) {
-      set_w64(atoi(argv[i+1]));
-      i=i+2;
-
-    } else if (strncasecmp(argv[i],"-p64",4)==0) {
-      set_p64(atoi(argv[i+1]));
-      i=i+2;
-
-    } else if (strncasecmp(argv[i],"-m",2)==0) {
-      main_tag=argv[i+1];
-      i=i+2;
-
-    } else if (strncasecmp(argv[i],"-e",2)==0) {
-      set_event_tag(strdup(argv[i+1]));
-      i=i+2;
-
-    } else if (strncasecmp(argv[i],"-",1)==0) {
-      printf("\n  ?unknown command line arg: %s\n\n",argv[i]);
-      exit(EXIT_FAILURE);
-
-    } else {
-      break;
+        } else {
+            break;
+        }
     }
-  }
-  
-  /* last arg better be filename */
-  filename=argv[argc-1];
 
-  return;
+    /* last arg better be filename */
+    filename=argv[argc-1];
+
+    return;
 }
 
 
@@ -776,7 +583,7 @@ static void create_dictionary(char *dictfilename) {
         len=fread(xmlbuf,1,MAXXMLBUF,dictfile);
         XML_Parse(dictParser,xmlbuf,len,len<MAXXMLBUF);
     } while (len==MAXXMLBUF);
-  
+
 
     fclose(dictfile);
     return;
@@ -802,7 +609,7 @@ static void startDictElement(void *userData, const char *name, const char **atts
         printf("\n?too many dictionary entries in file\n\n");
         exit(EXIT_FAILURE);
     }
-  
+
 
     /* store tags */
     nt=0;
@@ -813,7 +620,7 @@ static void startDictElement(void *userData, const char *name, const char **atts
         tagtext=strdup(cp);
         for(i=0; i<strlen(tagtext); i++) if(tagtext[i]=='.')nt++;
         ip=(int*)malloc(nt*sizeof(int));
-    
+
         i=0;
         p=tagtext-1;
         do {
@@ -832,7 +639,7 @@ static void startDictElement(void *userData, const char *name, const char **atts
         numtext=strdup(cp);
         for(i=0; i<strlen(numtext); i++) if(numtext[i]=='.')nn++;
         in=(int*)malloc(nn*sizeof(int));
-    
+
         i=0;
         p=numtext-1;
         do {
@@ -840,7 +647,7 @@ static void startDictElement(void *userData, const char *name, const char **atts
             p=strchr(p,'.');
         } while (p!=NULL);
     }
-    
+
 
     /* store dictionary info */
     dict[ndict-1].name = strdup(get_char_att(atts,natt,"name"));
@@ -866,12 +673,14 @@ void evio_xmldump(unsigned int *buf, int bufnum, char *string, int len) {
 
     nbuf=bufnum;
     xml=string;
-    xmllen=len;
 
-    xml+=sprintf(xml,"\n\n<!-- ===================== Buffer %d contains %d words (%d bytes) "
-            "===================== -->\n\n",nbuf,buf[0]+1,4*(buf[0]+1));
-  
+    indent();
+
+    xml+=sprintf(xml,"<!-- ===================== Buffer %d contains %d words (%d bytes) "
+            "===================== -->\n",nbuf,buf[0]+1,4*(buf[0]+1));
+
     depth=0;
+    decreaseIndent();
     dump_fragment(buf,BANK);
 
 
@@ -897,7 +706,7 @@ void set_user_frag_select_func( int (*f) (int tag) ) {
  */
 static void dump_fragment(unsigned int *buf, int fragment_type) {
 
-    int length,type,is_a_container,noexpand, padding=0;
+    int i, length,type,is_a_container,noexpand, padding=0;
     unsigned short tag;
     unsigned char num;
 
@@ -921,7 +730,7 @@ static void dump_fragment(unsigned int *buf, int fragment_type) {
             tag         = (buf[0]>>24)&0xff;
             num         = -1;  /* doesn't have num */
             break;
-    
+
         case TAGSEGMENT:
             length      = (buf[0]&0xffff)+1;
             type        = (buf[0]>>16)&0xf;
@@ -953,9 +762,13 @@ static void dump_fragment(unsigned int *buf, int fragment_type) {
     noexpand=is_a_container&&(max_depth>=0)&&(depth>max_depth);
 
 
+    /* xml opening fragment */
+    increaseIndent();
+
+
     /* verbose header */
     if(verbose!=0) {
-        xml+=sprintf(xml,"\n"); indent(0);
+        xml+=sprintf(xml,"\n"); indent();
         if(fragment_type==BANK) {
             xml+=sprintf(xml,"<!-- header words: %d, %#x -->\n",buf[0],buf[1]);
         } else {
@@ -964,9 +777,7 @@ static void dump_fragment(unsigned int *buf, int fragment_type) {
     }
 
 
-    /* xml opening fragment */
-    indent(0);
-
+    indent();
 
     /* format and content */
     if((fragment_type==BANK)&&(depth==1)) {
@@ -988,11 +799,12 @@ static void dump_fragment(unsigned int *buf, int fragment_type) {
     /* data_type, tag, and num */
     if(brief==0)xml+=sprintf(xml," data_type=\"0x%x\"",type);
     if(brief==0)xml+=sprintf(xml," tag=\"%d\"",tag);
+    if(brief==0)xml+=sprintf(xml," padding=\"%d\"",padding);
     if((brief==0)&&(fragment_type==BANK))xml+=sprintf(xml," num=\"%d\"",(int)num);
 
     /* length, ndata for verbose */
-    if(verbose!=0) {
-        xml+=sprintf(xml," length=\"%d\" ndata=\"%d\"",length,
+    /*sergey if(verbose!=0) replaced by*/if(brief==0) {
+        xml+=sprintf(xml," length=\"%d\" ndata=\"%d\"", (length-1),
                      get_ndata(type, (length - fragment_offset[fragment_type]), padding));
     }
 
@@ -1000,17 +812,18 @@ static void dump_fragment(unsigned int *buf, int fragment_type) {
     /* noexpand option */
     if(noexpand)xml+=sprintf(xml," opt=\"noexpand\"");
     xml+=sprintf(xml,">\n");
-  
+
 
     /* fragment data */
     dump_data(&buf[fragment_offset[fragment_type]], type,
-               length-fragment_offset[fragment_type], padding, noexpand);
+              length-fragment_offset[fragment_type], padding, noexpand);
 
 
     /* xml closing fragment */
-    indent(0);
+    indent();
     if((fragment_type==BANK)&&(depth==1)) {
         xml+=sprintf(xml,"</%s>\n\n",event_tag);
+        indent();
         xml+=sprintf(xml,"<!-- end buffer %d -->\n\n",nbuf);
     } else if(myname!=NULL) {
         xml+=sprintf(xml,"</%s>\n",myname);
@@ -1022,12 +835,140 @@ static void dump_fragment(unsigned int *buf, int fragment_type) {
         xml+=sprintf(xml,"</%s>\n",evGetTypename(type));
     }
 
+    decreaseIndent();
 
     /* decrement stack depth */
     depth--;
 
 
     return;
+}
+
+
+/*---------------------------------------------------------------- */
+
+/**
+ * This routine represents the contents of a single composite data type
+ * in the xml string.
+ *
+ * @param buf buffer with composite data
+ * @return the number of words in single composite item's evio representation.
+ */
+static int dump_composite(unsigned int *buf) {
+
+    int i, length, type, is_a_container, noexpand, compLen=1;
+    unsigned short tag;
+    unsigned char num;
+
+    int padding;
+    int index = 1;
+    int nfmt;
+    int sLen;
+    char fmt[256], *ch;
+    unsigned char ifmt[256];
+    int ifmtlength = 255;
+
+
+    /* get format info from tag fragment */
+    length  	= (buf[0]&0xffff)+1;
+    type    	= (buf[0]>>16)&0xf;
+    tag     	= (buf[0]>>20)&0xfff;
+    num     	= -1;   /* doesn't have num */
+
+    /*
+    printf("1---> %d %d %d %d\n",length,type,tag,num);
+    */
+
+
+    /* update depth, tagstack, numstack, etc. */
+    depth++;
+    is_a_container = evIsContainer(type);
+    noexpand = is_a_container && (max_depth >= 0) && (depth > max_depth);
+
+    /* verbose header */
+    if(verbose!=0) {
+        xml += sprintf(xml,"\n");
+        indent();
+        xml += sprintf(xml, "<!-- header word: %#x -->\n",buf[0]);
+    }
+
+
+    /* signify start of array element */
+    indent();
+    xml += sprintf(xml, "<comp>\n");
+
+
+    /* format and content */
+    increaseAndIndent();
+    xml += sprintf(xml, "<format ");
+
+
+    /* data_type, tag, and num */
+    if (brief==0) xml += sprintf(xml," data_type=\"0x%x\"",type);
+    if (brief==0) xml += sprintf(xml," tag=\"%d\"",tag);
+
+
+    /* length, ndata */
+    xml += sprintf(xml, " length=\"%d\" ndata=\"%d\"", (length-1), get_ndata(type,length-1,0));
+
+    /* noexpand option */
+    if (noexpand) xml += sprintf(xml," opt=\"noexpand\"");
+    xml += sprintf(xml, ">\n");
+
+
+    /* dump format string. Just one string, ends on null so simple */
+    /* tag contains the number of characters in format string - Sergey */
+    /*TODO: This was never mentioned to me - Carl */
+    increaseAndIndent();
+    xml += sprintf(xml,"%s\n", (char*)&buf[1]);
+
+
+    /* xml closing fragment */
+    decreaseAndIndent();
+    xml += sprintf(xml,"</format>\n");
+
+
+    /* decrement stack depth */
+    depth--;
+
+
+    /* dump data using format */
+    ch = (char*)&buf[index];
+    sLen = strlen(ch);
+    strncpy(fmt,ch, sLen);
+    fmt[sLen] = '\0';
+
+    nfmt = eviofmt(fmt, ifmt, ifmtlength);
+/*printf("format string = %s, nfmt = %d\n",fmt, nfmt);*/
+
+    /* skip the rest of tagsegment */
+    index += (length-1);
+
+
+    length  =  buf[index] + 1;
+    tag     = (buf[index+1] >> 16) & 0xffff;
+    type    = (buf[index+1] >> 8) & 0x3f;
+    num     =  buf[index+1] & 0xff;
+    padding = (buf[index+1] >> 14) & 0x3;
+
+
+    /* skip bank header */
+    index  += 2;
+    length -= 2;
+    compLen = index + length;
+
+/*printf("length = %d words, padding = %d extra bytes\n",length, padding);*/
+
+    indent();
+    xml += sprintf(xml,"<data  tag=\"%d\" num=\"%d\">\n",tag, num);
+    xml += eviofmtdump((int *)&buf[index], length, ifmt, nfmt, padding, getIndent(), !xtod, xml);
+    indent();
+    xml += sprintf(xml,"</data>\n");
+
+    decreaseAndIndent();
+    xml+=sprintf(xml,"</comp>\n");
+
+    return compLen;
 }
 
 
@@ -1043,29 +984,29 @@ static void dump_fragment(unsigned int *buf, int fragment_type) {
  */
 static void dump_data(unsigned int *data, int type, int length, int padding, int noexpand) {
 
-    int i,j,len;
+    int i,j,len, compLen=0;
     int p=0;
     short *s;
     char *c, *start;
     unsigned char *uc;
     char format[132];
-    int fLen,fTag,dLen,dTag,dNum;
-
-
-    nindent+=indent_size;
-
 
     /* dump data if no expansion, even if this is a container */
     if (noexpand) {
-        sprintf(format,"%%#%d%s ",w32,(xtod==0)?"x":"d");
+        if (xtod) {
+            sprintf(format,"%%11d  ");
+        }
+        else {
+            sprintf(format,"0x%%08x  ");
+        }
+
         for(i=0; i<length; i+=n32) {
-            indent(0);
+            indent();
             for(j=i; j<min((i+n32),length); j++) {
                 xml+=sprintf(xml,format,data[j]);
             }
             xml+=sprintf(xml,"\n");
         }
-        nindent-=indent_size;
         return;
     }
 
@@ -1075,46 +1016,58 @@ static void dump_data(unsigned int *data, int type, int length, int padding, int
 
         /* unknown */
         case 0x0:
+
             /* unsigned 32 bit int */
         case 0x1:
             if(!no_data) {
-                sprintf(format,"%%#%d%s ",w32,(xtod==0)?"x":"d");
+                increaseIndent();
+                if (xtod) {
+                    sprintf(format,"%%11u  ");
+                }
+                else {
+                    sprintf(format,"0x%%08x  ");
+                }
                 for(i=0; i<length; i+=n32) {
-                    indent(0);
+                    indent();
                     for(j=i; j<min((i+n32),length); j++) {
                         xml+=sprintf(xml,format,data[j]);
                     }
                     xml+=sprintf(xml,"\n");
                 }
+                decreaseIndent();
             }
             break;
 
             /* 32 bit float */
         case 0x2:
             if(!no_data) {
-                sprintf(format,"%%#%d.%df ",w32,p32);
+                increaseIndent();
+                sprintf(format,"%%#15.8g  ");
                 for(i=0; i<length; i+=n32) {
-                    indent(0);
+                    indent();
                     for(j=i; j<min(i+n32,length); j++) {
                         xml+=sprintf(xml,format,*(float*)&data[j]);
                     }
                     xml+=sprintf(xml,"\n");
                 }
+                decreaseIndent();
             }
             break;
 
-  /* string */ // TODO: need to print array of strings
+            /* string */ // TODO: need to print array of strings
         case 0x3:
             if(!no_data) {
+                increaseIndent();
                 start=(char*)&data[0];
                 c=start;
                 while((c[0]!=0x4)&&((c-start)<length*4)) {
                     len=strlen(c);
-                    indent(0);
+                    indent();
                     sprintf(format,"<![CDATA[%%.%ds]]>\n",len);
                     xml+=sprintf(xml,format,c);
                     c+=len+1;
                 }
+                decreaseIndent();
             }
             break;
 
@@ -1122,17 +1075,24 @@ static void dump_data(unsigned int *data, int type, int length, int padding, int
         case 0x4:
             if(!no_data) {
                 int numShorts = 2*length;
+                increaseIndent();
                 if (padding == 2) numShorts--;
-      
-                sprintf(format,"%%%dhd ",w16);
+
+                if (xtod) {
+                    sprintf(format,"%%6hd  ");
+                }
+                else {
+                    sprintf(format,"0x%%04hx  ");
+                }
                 s=(short*)&data[0];
                 for(i=0; i<numShorts; i+=n16) {
-                    indent(0);
+                    indent();
                     for(j=i; j<min(i+n16,numShorts); j++) {
                         xml+=sprintf(xml,format,s[j]);
                     }
                     xml+=sprintf(xml,"\n");
                 }
+                decreaseIndent();
             }
             break;
 
@@ -1140,17 +1100,24 @@ static void dump_data(unsigned int *data, int type, int length, int padding, int
         case 0x5:
             if(!no_data) {
                 int numShorts = 2*length;
+                increaseIndent();
                 if (padding == 2) numShorts--;
-      
-                sprintf(format,"%%#%d%s ",w16,(xtod==0)?"hx":"d");
+
+                if (xtod) {
+                    sprintf(format,"%%6hu  ");
+                }
+                else {
+                    sprintf(format,"0x%%04hx  ");
+                }
                 s=(short*)&data[0];
                 for(i=0; i<numShorts; i+=n16) {
-                    indent(0);
+                    indent();
                     for(j=i; j<min(i+n16,numShorts); j++) {
                         xml+=sprintf(xml,format,s[j]);
                     }
                     xml+=sprintf(xml,"\n");
                 }
+                decreaseIndent();
             }
             break;
 
@@ -1158,17 +1125,24 @@ static void dump_data(unsigned int *data, int type, int length, int padding, int
         case 0x6:
             if(!no_data) {
                 int numBytes = 4*length;
+                increaseIndent();
                 if (padding >=1 && padding <= 3) numBytes -= padding;
 
-                sprintf(format,"   %%%dd ",w8);
+                if (xtod) {
+                    sprintf(format,"%%4d  ");
+                }
+                else {
+                    sprintf(format,"0x%%02hhx  ");
+                }
                 c=(char*)&data[0];
                 for(i=0; i<numBytes; i+=n8) {
-                    indent(0);
+                    indent();
                     for(j=i; j<min(i+n8,numBytes); j++) {
                         xml+=sprintf(xml,format,c[j]);
                     }
                     xml+=sprintf(xml,"\n");
                 }
+                decreaseIndent();
             }
             break;
 
@@ -1176,105 +1150,114 @@ static void dump_data(unsigned int *data, int type, int length, int padding, int
         case 0x7:
             if(!no_data) {
                 int numBytes = 4*length;
+                increaseIndent();
                 if (padding >=1 && padding <= 3) numBytes -= padding;
 
-                sprintf(format,"   %%#%d%s ",w8,(xtod==0)?"x":"d");
+                if (xtod) {
+                    sprintf(format,"%%4u  ");
+                }
+                else {
+                    sprintf(format,"0x%%02hhx  ");
+                }
                 uc=(unsigned char*)&data[0];
                 for(i=0; i<numBytes; i+=n8) {
-                    indent(0);
+                    indent();
                     for(j=i; j<min(i+n8,numBytes); j++) {
                         xml+=sprintf(xml,format,uc[j]);
                     }
                     xml+=sprintf(xml,"\n");
                 }
+                decreaseIndent();
             }
             break;
 
             /* 64 bit double */
         case 0x8:
             if(!no_data) {
-                sprintf(format,"%%#%d.%de ",w64,p64);
+                increaseIndent();
+                sprintf(format,"%%#25.17g  ");
                 for(i=0; i<length/2; i+=n64) {
-                    indent(0);
+                    indent();
                     for(j=i; j<min(i+n64,length/2); j++) {
                         xml+=sprintf(xml,format,*(double*)&data[2*j]);
                     }
                     xml+=sprintf(xml,"\n");
                 }
+                decreaseIndent();
             }
             break;
 
             /* 64 bit int */
         case 0x9:
             if(!no_data) {
-                sprintf(format,"%%%dlld ",w64);
+                increaseIndent();
+                if (xtod) {
+                    sprintf(format,"%%20lld  ");
+                }
+                else {
+                    sprintf(format,"0x%%016llx  ");
+                }
                 for(i=0; i<length/2; i+=n64) {
-                    indent(0);
+                    indent();
                     for(j=i; j<min(i+n64,length/2); j++) {
-                        xml+=sprintf(xml,format,*(long long*)&data[2*j]);
+                        xml+=sprintf(xml,format,*(int64_t *)&data[2*j]);
                     }
                     xml+=sprintf(xml,"\n");
                 }
+                decreaseIndent();
             }
             break;
 
             /* unsigned 64 bit int */
         case 0xa:
             if(!no_data) {
-                sprintf(format,"%%#%dll%s ",w64,(xtod==0)?"x":"d");
+                increaseIndent();
+                if (xtod) {
+                    sprintf(format,"%%20llu  ");
+                }
+                else {
+                    sprintf(format,"0x%%016llx  ");
+                }
                 for(i=0; i<length/2; i+=n64) {
-                    indent(0);
+                    indent();
                     for(j=i; j<min(i+n64,length/2); j++) {
-                        xml+=sprintf(xml,format,*(long long*)&data[2*j]);
+                        xml+=sprintf(xml,format,*(uint64_t *)&data[2*j]);
                     }
                     xml+=sprintf(xml,"\n");
                 }
+                decreaseIndent();
             }
             break;
 
             /* 32 bit int */
         case 0xb:
             if(!no_data) {
-                sprintf(format,"%%#%dd ",w32);
+                increaseIndent();
+                if (xtod) {
+                    sprintf(format,"%%11d  ");
+                }
+                else {
+                    sprintf(format,"0x%%08x  ");
+                }
                 for(i=0; i<length; i+=n32) {
-                    indent(0);
+                    indent();
                     for(j=i; j<min((i+n32),length); j++) {
                         xml+=sprintf(xml,format,data[j]);
                     }
                     xml+=sprintf(xml,"\n");
                 }
+                decreaseIndent();
             }
             break;
 
-            /* composite */
+            /* composite array */
         case 0xf:
             if(!no_data) {
-                fLen=data[0]&0xffff;
-                fTag=(data[0]>>20)&0xfff;
-                c=(char*)&data[1];
-                indent(4);
-                xml+=sprintf(xml,"<formatString tag=\"%d\">\n",fTag);
-                indent(11);
-                xml+=sprintf(xml,"%s\n",c);
-                indent(4);
-                xml+=sprintf(xml,"</formatString>\n");
-      
-
-                dLen=data[fLen+1]-1;
-                dTag=data[fLen+2]>>16;
-                dNum=data[fLen+2]&0xff;
-                indent(4);
-                xml+=sprintf(xml,"<data tag=\"%d\" num=\"%d\">\n",dTag,dNum);
-                sprintf(format,"%%#%d%s ",w32,(xtod==0)?"x":"d");
-                for(i=0; i<dLen; i+=n32) {
-                    indent(7);
-                    for(j=i; j<min((i+n32),dLen); j++) {
-                        xml+=sprintf(xml,format,data[fLen+3+j]);
-                    }
-                    xml+=sprintf(xml,"\n");
+                while (compLen < length) {
+                    increaseIndent();
+                    compLen += dump_composite(&data[compLen]);
+                    decreaseIndent();
                 }
-                indent(4);
-                xml+=sprintf(xml,"</data>\n");
             }
             break;
 
@@ -1306,21 +1289,26 @@ static void dump_data(unsigned int *data, int type, int length, int padding, int
 
         default:
             if(!no_data) {
-                sprintf(format,"%%#%d%s ",w32,(xtod==0)?"x":"d");
+                increaseIndent();
+                if (xtod) {
+                    sprintf(format,"%%11u  ");
+                }
+                else {
+                    sprintf(format,"0x%%08x  ");
+                }
+
                 for(i=0; i<length; i+=n32) {
-                    indent(0);
+                    indent();
                     for(j=i; j<min(i+n32,length); j++) {
                         xml+=sprintf(xml,format,(unsigned int)data[j]);
                     }
                     xml+=sprintf(xml,"\n");
                 }
+                decreaseIndent();
             }
             break;
     }
 
-
-    /* decrease indent */
-    nindent-=indent_size;
     return;
 }
 
@@ -1343,12 +1331,10 @@ static int get_ndata(int type, int length, int padding) {
         case 0x1:
         case 0x2:
             return(length);
-            break;
 
         case 0x3:
             //??? // TODO: strings arrays?
             return(1);
-            break;
 
             /* 16 bit ints */
         case 0x4:
@@ -1357,7 +1343,6 @@ static int get_ndata(int type, int length, int padding) {
                 return(2*length - 1);
             }
             return(2*length);
-            break;
 
             /* 8 bit ints */
         case 0x6:
@@ -1366,13 +1351,11 @@ static int get_ndata(int type, int length, int padding) {
                 return(4*length - padding);
             }
             return(4*length);
-            break;
 
         case 0x8:
         case 0x9:
         case 0xa:
             return(length/2);
-            break;
 
         case 0xb:
         case 0xc:
@@ -1383,21 +1366,9 @@ static int get_ndata(int type, int length, int padding) {
         case 0x40:
         default:
             return(length);
-            break;
     }
 }
 
-
-/*---------------------------------------------------------------- */
-
-
-static void indent(int extra) {
-
-    int i;
-
-    for(i=0; i<nindent+extra; i++)xml+=sprintf(xml," ");
-    return;
-}
 
 
 /*---------------------------------------------------------------- */
@@ -1426,7 +1397,7 @@ static const char *get_matchname() {
 
     /* search dictionary for tag/num match */
     for(i=0; i<ndict; i++) {
-    
+
         tagmatch=1;
         ntd=dict[i].ntag;
         if(ntd>0) {
@@ -1462,14 +1433,87 @@ static const char *get_matchname() {
 
 
 /*---------------------------------------------------------------- */
-
-
 void evio_xmldump_done(char *string, int len) {
-
     sprintf(string," ");
     return;
 }
 
 
+/*---------------------------------------------------------------- */
+/*--- Set functions ---------------------------------------------- */
+/*---------------------------------------------------------------- */
 
+
+int set_event_tag(char *tag) {
+    event_tag=tag;
+    return(0);
+}
+
+/*---------------------------------------------------------------- */
+int set_bank2_tag(char *tag) {
+    bank2_tag=tag;
+    return(0);
+}
+
+/*---------------------------------------------------------------- */
+int set_n8(int val) {
+    n8=val;
+    return(0);
+}
+
+/*---------------------------------------------------------------- */
+int set_n16(int val) {
+    n16=val;
+    return(0);
+}
+
+/*---------------------------------------------------------------- */
+int set_n32(int val) {
+    n32=val;
+    return(0);
+}
+
+/*---------------------------------------------------------------- */
+int set_n64(int val) {
+    n64=val;
+    return(0);
+}
+
+/*---------------------------------------------------------------- */
+int set_xtod(int val) {
+    xtod=val;
+    return(0);
+}
+
+/*---------------------------------------------------------------- */
+int set_max_depth(int val) {
+    max_depth=val;
+    return(0);
+}
+
+/*---------------------------------------------------------------- */
+int set_no_typename(int val) {
+    no_typename=val;
+    return(0);
+}
+
+/*---------------------------------------------------------------- */
+int set_verbose(int val) {
+    verbose=val;
+    return(0);
+}
+
+/*---------------------------------------------------------------- */
+int set_brief(int val) {
+    brief=val;
+    return(0);
+}
+
+/*---------------------------------------------------------------- */
+int set_no_data(int val) {
+    no_data=val;
+    return(0);
+}
+
+/*---------------------------------------------------------------- */
 

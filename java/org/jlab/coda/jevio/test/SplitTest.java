@@ -2,9 +2,7 @@ package org.jlab.coda.jevio.test;
 
 import org.jlab.coda.jevio.*;
 
-import java.io.File;
 import java.io.IOException;
-import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 
 /**
@@ -18,7 +16,8 @@ public class SplitTest {
     // xml dictionary
     static String xmlDictionary =
                     "<xmlDict>\n" +
-                    "  <dictEntry name=\"TAG1_NUM1\" tag=\"1\"  num=\"1\"/>\n" +
+                            "  <dictEntry name=\"TAG1_NUM1\" tag=\"1\"  num=\"1\"/>\n" +
+                            "  <dictEntry name=\"TAG1\"      tag=\"1\"  />\n" +
                     "</xmlDict>";
 
 
@@ -71,7 +70,7 @@ public class SplitTest {
             String baseFileName = builder.toString();
             // Also create the first file's name with more substitutions
             String fileName = Utilities.generateFileName(baseFileName, specifierCount,
-                    runNumber, split, splitCount++);
+                    runNumber, split, splitCount++, 0, 1);
             System.out.println("EventWriter const: filename = " + fileName);
             System.out.println("                   basename = " + baseName);
         }

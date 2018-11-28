@@ -65,13 +65,20 @@
  * int  evWrite                (int handle, const uint32_t *buffer)
  * int  evIoctl                (int handle, char *request, void *argp)
  * int  evClose                (int handle)
+ * int  evFlush                (int handle)
  * int  evGetBufferLength      (int handle, uint32_t *length)
  * int  evGetRandomAccessTable (int handle, const uint32_t *** const table, uint32_t *len)
  * int  evGetDictionary        (int handle, char **dictionary, uint32_t *len)
  * int  evWriteDictionary      (int handle, char *xmlDictionary)
+ * int  evWriteFirstEvent      (int handle, const uint32_t *firstEvent)
+ * int  evCreateFirstEventBlock(const uint32_t *firstEvent, int localEndian, void **block, uint32_t *words)
+ * int  evStringsToBuf         (uint32_t *buffer, int bufLen, char **strings, int stringCount, int *dataLen)
+ * int  evBufToStrings         (char *buffer, int bufLen, char ***pStrArray, int *strCount)
  * int  evIsContainer          (int type)
  * char *evPerror              (int error)
  * const char *evGetTypename   (int type)
+ * int  evIsLastBLock          (uint32_t sixthWord)
+ * void evPrintBuffer          (uint32_t *p, uint32_t len, int swap)
  */
 
 
@@ -107,16 +114,20 @@
 /** Version 3's fixed block size in 32 bit words */
 #define EV_BLOCKSIZE_V3 8192
 
-/** Version 4's target block size in 32 bit words (256kB) */
-#define EV_BLOCKSIZE_V4 64000
+/** Version 4's target block size in 32 bit words (16MB).
+ * It is a soft limit since a single event larger than
+ * this limit may need to be written. */
+#define EV_BLOCKSIZE_V4 500000
 
-/** Minimum block size allowed if size reset */
-#define EV_BLOCKSIZE_MIN 256
-/*#define EV_BLOCKSIZE_MIN 16*/
-
-/** Maximum block size allowed if size reset. Need to play nice with jevio.
- * Can be a max of (2^31 - 1 - 2headers) = 2147483583 , but set it to 100MB. */
-#define EV_BLOCKSIZE_MAX 25600000
+/** Minimum block size in 32 bit words allowed if size reset (32kB) */
+#define EV_BLOCKSIZE_MIN 16
+/**
+ * The upper limit of maximum size for a single block used for writing
+ * is 2^25 ints or words. This gives block sizes of about 134MB.
+ * It is a soft limit since a single event larger than this limit
+ * may need to be written.
+ */
+#define EV_BLOCKSIZE_MAX 33554432
 
 /** In version 4, lowest 8 bits are version, rest is bit info */
 #define EV_VERSION_MASK 0xFF
@@ -127,7 +138,10 @@
 /** In version 4, "last block" is 10th bit in version/info word */
 #define EV_LASTBLOCK_MASK 0x200
 
-/** In version 4, maximum max number of events per block */
+/** In version 4, "first event" is 15th bit in version/info word */
+#define EV_FIRSTEVENT_MASK 0x4000
+
+/** In version 4, upper limit on maximum max number of events per block */
 #define EV_EVENTS_MAX 100000
 
 /** In version 4, default max number of events per block */
@@ -135,6 +149,13 @@
 
 /** In version 4, if splitting file, default split size in bytes (2GB) */
 #define EV_SPLIT_SIZE 2000000000L
+
+/** In versions 1-3, default size for a single file read in bytes.
+ *  Equivalent to 500, 32,768 byte blocks.
+ *  This constant <b>MUST BE</b> an integer multiple of 32768.*/
+#define EV_READ_BYTES_V3 16384000
+//#define EV_READ_BYTES_V3 (32768)
+
 
 /**
  * @file
@@ -232,7 +253,12 @@
  *   Bits 11-14 = type of events following (ROC Raw = 0, Physics = 1, PartialPhysics = 2,
  *                DisentangledPhysics = 3, User = 4, Control = 5, Prestart = 6, Go = 7,
  *                Pause = 8, End = 9, Other = 15)
+ *   Bit  15    = true if block contains "first" event which gets written in each file split
  *
+ *                Bits 11-15 are ONLY for the CODA online use of evio.
+ *                That's because only a single CODA event TYPE is placed into
+ *                a single ET or cMsg buffer. Each user or control event has its own
+ *                buffer. Thus all events parsed from a single buffer will be of a single CODA type.
  *
  * ################################
  * COMPOSITE DATA:
@@ -304,7 +330,7 @@
 
 /** Initialize a block header */
 #define initBlockHeader(a) { \
-    (a)[EV_HD_BLKSIZ] = 0; \
+    (a)[EV_HD_BLKSIZ] = 8; \
     (a)[EV_HD_BLKNUM] = 1; \
     (a)[EV_HD_HDSIZ]  = EV_HDSIZ; \
     (a)[EV_HD_COUNT]  = 0; \
@@ -314,20 +340,18 @@
     (a)[EV_HD_MAGIC]  = EV_MAGIC; \
 } \
 
-/** Initialize a last block header */
-#define initLastBlockHeader(a,b) { \
+/** Initialize a block header */
+#define initBlockHeader2(a,b) { \
     (a)[EV_HD_BLKSIZ] = 8; \
     (a)[EV_HD_BLKNUM] = b; \
     (a)[EV_HD_HDSIZ]  = EV_HDSIZ; \
     (a)[EV_HD_COUNT]  = 0; \
     (a)[EV_HD_RESVD1] = 0; \
-    (a)[EV_HD_VER]    = EV_VERSION | EV_LASTBLOCK_MASK; \
+    (a)[EV_HD_VER]    = EV_VERSION; \
     (a)[EV_HD_RESVD2] = 0; \
     (a)[EV_HD_MAGIC]  = EV_MAGIC; \
 } \
 
-/* Prototypes for swap routine in evioswap.c */
-uint32_t *swap_int32_t(uint32_t *data, unsigned int length, uint32_t *dest);
 
 /* Prototypes for static routines */
 static  int      fileExists(char *filename);
@@ -339,31 +363,29 @@ static  int      tcpRead(int fd, void *vptr, int n);
 static  int      evReadAllocImpl(EVFILE *a, uint32_t **buffer, uint32_t *buflen);
 static  void     localClose(EVFILE *a);
 static  int      getEventCount(EVFILE *a, uint32_t *count);
-static  int      evWriteImpl(int handle, const uint32_t *buffer, int useMutex, int isDictionary);
-static  int      evFlush(EVFILE *a);
+static  int      evWriteImpl(int handle, const uint32_t *buffer, int useMutex);
+static  int      flushToFile(EVFILE *a, int force, int *wroteData);
+
 static  int      splitFile(EVFILE *a);
-static  int      evWriteDictImpl(EVFILE *a, const uint32_t *buffer);
 static  int      generateSixthWord(int version, int hasDictionary, int isEnd, int eventType);
-static  void     resetBuffer(EVFILE *a);
+static  void     resetBuffer(EVFILE *a, int beforeDictionary);
 static  int      expandBuffer(EVFILE *a, uint32_t newSize);
-static  int      evWriteDictImpl(EVFILE *a, const uint32_t *buffer);
+static  int      evWriteDictImpl(EVFILE *a);
+static  int      evWriteCommonBlock(EVFILE *a);
 static  void     writeEventToBuffer(EVFILE *a, const uint32_t *buffer,
                                     uint32_t wordsToWrite, int isDictionary);
-static  int      writeEmptyLastBlockHeader(EVFILE *a, int blockNumber);
-static  int      writeNewHeader(EVFILE *a, uint32_t wordSize,
-                          uint32_t eventCount, uint32_t blockNumber,
-                          int hasDictionary,   int isLast,
-                          int isCurrentHeader, int absoluteMode);
+static  int      writeNewHeader(EVFILE *a,
+                                uint32_t eventCount, uint32_t blockNumber,
+                                int hasDictionary, int isLast);
+static int       evGetNewBufferFileV3(EVFILE *a);
+static int       evReadAllocImplFileV3(EVFILE *a, uint32_t **buffer, uint32_t *buflen);
+static int       evReadFileV3(EVFILE *a, uint32_t *buffer, uint32_t buflen);
+
 
 /* Dealing with EVFILE struct */
 static void      structInit(EVFILE *a);
-static void      structDestroy(EVFILE *a);
-static void      mutexLock(EVFILE *a);
-static void      mutexUnlock(EVFILE *a);
-static void      handleReadLock(int handle);
-static void      handleReadUnlock(int handle);
-static void      handleWriteLock(int handle);
-static void      handleWriteUnlock(int handle);
+static void      handleLock(int handle);
+static void      handleUnlock(int handle);
 static void      getHandleLock(void);
 static void      getHandleUnlock(void);
 
@@ -377,135 +399,121 @@ static  int      generatePointerTable(EVFILE *a);
 /* Array that holds all pointers to structures created with evOpen().
  * Space in the array is allocated as needed, beginning with 100
  * and adding 50% every time more are needed. */
-static EVFILE **handleList = NULL;
+EVFILE **handleList = NULL;
 /* The number of handles available for use. */
-static int handleCount = 0;
+static size_t handleCount = 0;
 
-#ifndef VXWORKS
-    /* Pthread mutex for serializing calls to get and free handles. */
-    static pthread_mutex_t getHandleMutex = PTHREAD_MUTEX_INITIALIZER;
-    /*static pthread_rwlock_t handleLock = PTHREAD_RWLOCK_WRITER_NONRECURSIVE_INITIALIZER_NP;*/
-  
-    /* Array of pthread read-write lock pointers for preventing simultaneous calls
-     * to evClose and read/write routines. Need 1 for each evOpen() call. */
-    static pthread_rwlock_t **handleLocks = NULL;
-    
-#elif defined VXWORKS_5
+/* Pthread mutex for serializing calls to get and free handles. */
+static pthread_mutex_t getHandleMutex = PTHREAD_MUTEX_INITIALIZER;
 
-    /** Implementation of strdup for vxWorks. */
-    static char *strdup(const char *s1) {
-        char *s;
-        if (s1 == NULL) return NULL;
-        if ((s = (char *) malloc(strlen(s1)+1)) == NULL) return NULL;
-        return strcpy(s, s1);
-    }
-    
-    /** Implementation of strndup for vxWorks. */
-    static char *strndup(const char *s1, size_t count) {
-        int len;
-        char *s;
-        if (s1 == NULL) return NULL;
-    
-        len = strlen(s1) > count ? count : strlen(s1);
-        if ((s = (char *) malloc(len+1)) == NULL) return NULL;
-        s[len] = '\0';
-        return strncpy(s, s1, len);
-    }
-    
-    /** Implementation of strcasecmp for vxWorks. */
-    static int strcasecmp(const char *s1, const char *s2) {
-        int i, len1, len2;
-      
-        /* handle NULL's */
-        if (s1 == NULL && s2 == NULL) {
-            return 0;
-        }
-        else if (s1 == NULL) {
-            return -1;
-        }
-        else if (s2 == NULL) {
-            return 1;
-        }
-      
-        len1 = strlen(s1);
-        len2 = strlen(s2);
-      
-        /* handle different lengths */
-        if (len1 < len2) {
-            for (i=0; i<len1; i++) {
-                if (toupper((int) s1[i]) < toupper((int) s2[i])) {
-                    return -1;
-                }
-                else if (toupper((int) s1[i]) > toupper((int) s2[i])) {
-                    return 1;
-                }
-            }
-            return -1;
-        }
-        else if (len1 > len2) {
-            for (i=0; i<len2; i++) {
-                if (toupper((int) s1[i]) < toupper((int) s2[i])) {
-                    return -1;
-                }
-                else if (toupper((int) s1[i]) > toupper((int) s2[i])) {
-                    return 1;
-                }
-            }
-            return 1;
-        }
-      
-        /* handle same lengths */
-        for (i=0; i<len1; i++) {
-            if (toupper((int) s1[i]) < toupper((int) s2[i])) {
-                return -1;
-            }
-            else if (toupper((int) s1[i]) > toupper((int) s2[i])) {
-                return 1;
-            }
-        }
-      
-        return 0;
-    }
-    
-    /** Implementation of strncasecmp for vxWorks. */
-    static int strncasecmp(const char *s1, const char *s2, size_t n) {
-        int i, len1, len2;
-      
-        /* handle NULL's */
-        if (s1 == NULL && s2 == NULL) {
-            return 0;
-        }
-        else if (s1 == NULL) {
-            return -1;
-        }
-        else if (s2 == NULL) {
-            return 1;
-        }
-      
-        len1 = strlen(s1);
-        len2 = strlen(s2);
-        
-        /* handle short lengths */
-        if (len1 < n || len2 < n) {
-            return strcasecmp(s1, s2);
-        }
-       
-        /* both lengths >= n, but compare only n chars */
-        for (i=0; i<n; i++) {
-            if (toupper((int) s1[i]) < toupper((int) s2[i])) {
-                return -1;
-            }
-            else if (toupper((int) s1[i]) > toupper((int) s2[i])) {
-                return 1;
-            }
-        }
-      
-        return 0;
-    }
+/* Array of pthread lock pointers for preventing simultaneous calls
+ * to evClose, read/write routines, etc. Need 1 for each evOpen() call. */
+static pthread_mutex_t **handleLocks = NULL;
 
+
+
+/*-----------------*
+ *     FORTRAN     *
+ *-----------------*/
+
+/**
+ * @defgroup fortran FORTRAN routines
+ * These routines handle limited evio operations for FORTRAN programs.
+ * @{
+ */
+
+/** Fortran interface to {@link #evOpen}. */
+#ifdef AbsoftUNIXFortran
+int evopen
+#else
+int evopen_
 #endif
+        (char *filename, char *flags, int *handle, int fnlen, int flen)
+{
+    char *fn, *fl;
+    int status;
+    fn = (char *) malloc((size_t )fnlen+1);
+    strncpy(fn,filename, (size_t )fnlen);
+    fn[fnlen] = 0;      /* insure filename is null terminated */
+    fl = (char *) malloc((size_t )flen+1);
+    strncpy(fl,flags,(size_t )flen);
+    fl[flen] = 0;           /* insure flags is null terminated */
+    status = evOpen(fn,fl,handle);
+    free(fn);
+    free(fl);
+    return(status);
+}
+
+
+/** Fortran interface to {@link #evRead}. */
+#ifdef AbsoftUNIXFortran
+int evread
+#else
+int evread_
+#endif
+        (int *handle, uint32_t *buffer, uint32_t *buflen)
+{
+    return(evRead(*handle, buffer, *buflen));
+}
+
+
+/** Fortran interface to {@link #evWrite}. */
+#ifdef AbsoftUNIXFortran
+int evwrite
+#else
+int evwrite_
+#endif
+        (int *handle, const uint32_t *buffer)
+{
+    return(evWrite(*handle, buffer));
+}
+
+
+/** Fortran interface to {@link #evClose}. */
+#ifdef AbsoftUNIXFortran
+int evclose
+#else
+int evclose_
+#endif
+        (int *handle)
+{
+    return(evClose(*handle));
+}
+
+
+/** Fortran interface to {@link #evIoctl}. */
+#ifdef AbsoftUNIXFortran
+int evioctl
+#else
+int evioctl_
+#endif
+        (int *handle, char *request, void *argp, int reqlen)
+{
+    char *req;
+    int32_t status;
+    req = (char *)malloc((size_t)reqlen+1);
+    strncpy(req,request,(size_t)reqlen);
+    req[reqlen]=0;		/* insure request is null terminated */
+    status = evIoctl(*handle,req,argp);
+    free(req);
+    return(status);
+}
+
+/** @} */
 
 /*-----------------------------------------------------------------------------*/
+/*-----------------------------------------------------------------------------*/
+
+/**
+ * Routine to take the 6th word of a block header and tell whether
+ * it's the last block or not.
+ *
+ * @param sixthWord  6th word of an evio block header
+ * @return 1 of this is the last block, else 0
+ */
+int evIsLastBlock(uint32_t sixthWord) {
+     return (sixthWord & EV_LASTBLOCK_MASK) > 0 ? 1 : 0;
+}
 
 
 /**
@@ -516,17 +524,19 @@ static int handleCount = 0;
  * @param swap swap if true
  */
 void evPrintBuffer(uint32_t *p, uint32_t len, int swap) {
-    uint32_t i;
+    uint32_t i, width=5;
     printf("\nBUFFER:\n");
     for (i=0; i < len; i++) {
+        if (i%width == 0) printf("%3u   ", i);
         if (swap) {
             uint32_t p_tmp = (uint32_t) EVIO_SWAP32(*p);
-            printf("%u   0x%08x\n", i, p_tmp);
+            printf("0x%08x  ", p_tmp);
             p++;
         }
         else {
-            printf("%u   0x%08x\n", i, *(p++));
+            printf("0x%08x  ", *(p++));
         }
+        if ((i+1)%width == 0) printf("\n");
     }
     printf("\n");
 }
@@ -551,9 +561,11 @@ static void structInit(EVFILE *a)
 
     /* block stuff */
     a->buf           = NULL;
+    a->pBuf          = NULL;
     a->next          = NULL;
     /* Space in number of words, not in header, left for writing */
     a->left          = EV_BLOCKSIZE_V4 - EV_HDSIZ;
+    a->blocksToParse = 0; /* for reading version 1-3 files */
     /* Total data written = block header size so far */
     a->blksiz        = EV_HDSIZ;
     a->blknum        = 1;
@@ -575,6 +587,8 @@ static void structInit(EVFILE *a)
     a->runNumber      = 1;
     a->specifierCount = 0;
     a->splitting      = 0;
+    a->lastEmptyBlockHeaderExists = 0;
+    a->streamId       = 0;
     a->splitNumber    = 0;
     a->split          = EV_SPLIT_SIZE;
     a->fileSize       = 0L;
@@ -583,6 +597,9 @@ static void structInit(EVFILE *a)
     a->eventsToBuf    = 0;
     a->eventsToFile   = 0;
     a->currentHeader  = NULL;
+
+    a->fileSize       = 0L;
+    a->filePosition   = 0L;
 
     /* buffer stuff */
     a->rwBuf        = NULL;
@@ -602,133 +619,75 @@ static void structInit(EVFILE *a)
     a->pTable   = NULL;
 
     /* dictionary */
+    a->hasAppendDictionary = 0;
     a->wroteDictionary = 0;
     a->dictLength = 0;
     a->dictBuf    = NULL;
     a->dictionary = NULL;
 
-    /* synchronization */
-    pthread_mutex_init(&a->lock, NULL);
+    /* first event */
+    a->firstEventLength = 0;
+    a->firstEventBuf    = NULL;
+
+    /* common block */
+    a->commonBlkCount   = 0;
+
+    /* sync */
+    a->lockingOn = 1;
 }
 
 
 /**
- * Routine to destroy an EVFILE structure.
- * @param a   pointer to structure being inititalized
+ * Routine to lock the pthread mutex used for acquiring and releasing handles
+ * and used only in evOpenImpl and evClose.
  */
-static void structDestroy(EVFILE *a)
-{   /* If it doesn't work, so what? */
-    pthread_mutex_destroy(&a->lock);
-}
-
-
-/**
- * Routine to lock the pthread mutex in an EVFILE structure.
- * @param a pointer to EVFILE structure
- */
-static void mutexLock(EVFILE *a)
-{
-    int status = pthread_mutex_lock(&a->lock);
-    if (status != 0) {
-        evio_err_abort(status, "Failed mutex lock");
-    }
-}
-
-
-/**
- * Routine to unlock the pthread mutex in an EVFILE structure.
- * @param a pointer to EVFILE structure
- */
-static void mutexUnlock(EVFILE *a)
-{
-    int status = pthread_mutex_unlock(&a->lock);
-    if (status != 0) {
-        evio_err_abort(status, "Failed mutex unlock");
-    }
-}
-
-
-/**
- * Routine to lock the pthread mutex used for getting and releasing handles.
- * @param a pointer to EVFILE structure
- */
-static void getHandleLock(void)
-{
-#ifndef VXWORKS
+static void getHandleLock(void) {
     int status;
     status = pthread_mutex_lock(&getHandleMutex);
     if (status != 0) {
         evio_err_abort(status, "Failed get handle lock");
     }
-#endif
 }
 
 
 /**
- * Routine to unlock the pthread mutex used for getting and releasing handles.
- * @param a pointer to EVFILE structure
+ * Routine to unlock the pthread mutex used for acquiring and releasing handles
+ * and used only in evOpenImpl and evClose.
  */
-static void getHandleUnlock(void)
-{
-#ifndef VXWORKS
+static void getHandleUnlock(void) {
     int status;
     status = pthread_mutex_unlock(&getHandleMutex);
     if (status != 0) {
         evio_err_abort(status, "Failed get handle unlock");
     }
-#endif
 }
 
 
 /** Routine to grab read lock used to prevent simultaneous
  *  calls to evClose and read/write routines. */
-static void handleReadLock(int handle) {
-#ifndef VXWORKS
-    pthread_rwlock_t *handleLock = handleLocks[handle-1];
-    int status = pthread_rwlock_rdlock(handleLock);
+static void handleLock(int handle) {
+    EVFILE *a = handleList[handle-1];
+    if (a == NULL || !a->lockingOn) return;
+
+    pthread_mutex_t *lock = handleLocks[handle-1];
+    int status = pthread_mutex_lock(lock);
     if (status != 0) {
-        evio_err_abort(status, "Failed handle read lock");
+        evio_err_abort(status, "Failed handle lock");
     }
-#endif
 }
 
 
 /** Routine to release read lock used to prevent simultaneous
  *  calls to evClose and read/write routines. */
-static void handleReadUnlock(int handle) {
-#ifndef VXWORKS
-    pthread_rwlock_t *handleLock = handleLocks[handle-1];
-    int status = pthread_rwlock_unlock(handleLock);
+static void handleUnlock(int handle) {
+    EVFILE *a = handleList[handle-1];
+    if (a == NULL || !a->lockingOn) return;
+
+    pthread_mutex_t *lock = handleLocks[handle-1];
+    int status = pthread_mutex_unlock(lock);
     if (status != 0) {
-        evio_err_abort(status, "Failed handle read unlock");
+        evio_err_abort(status, "Failed handle unlock");
     }
-#endif
-}
-
-
-/** Routine to grab write lock used to prevent simultaneous
- *  calls to evClose and read/write routines. */
-static void handleWriteLock(int handle) {
-#ifndef VXWORKS
-    pthread_rwlock_t *handleLock = handleLocks[handle-1];
-    int status = pthread_rwlock_wrlock(handleLock);
-    if (status != 0) {
-        evio_err_abort(status, "Failed handle write lock");
-    }
-#endif
-}
-
-
-/** Routine to release write lock used to prevent simultaneous
- *  calls to evClose and read/write routines. */
-static void handleWriteUnlock(int handle) {
-#ifndef VXWORKS
-    pthread_rwlock_t *handleLock = handleLocks[handle-1];
-    int status = pthread_rwlock_unlock(handleLock);
-    if (status != 0) {
-        evio_err_abort(status, "Failed handle write unlock");
-    }
-#endif
 }
 
 
@@ -739,8 +698,7 @@ static void handleWriteUnlock(int handle) {
  * @return S_SUCCESS if success
  * @return S_EVFILE_ALLOCFAIL if memory cannot be allocated
  */
-static int expandHandles()
-{
+static int expandHandles() {
     /* If this is the first initialization, add 100 places for 100 evOpen()'s */
     if (handleCount < 1 || handleList == NULL) {
         int i;
@@ -752,34 +710,31 @@ static int expandHandles()
             return S_EVFILE_ALLOCFAIL;
         }
 
-/* Take all the read-write locks out of vxWorks */
-#ifndef VXWORKS
-        handleLocks = (pthread_rwlock_t **) calloc(handleCount, sizeof(pthread_rwlock_t *));
+        handleLocks = (pthread_mutex_t **) calloc(handleCount, sizeof(pthread_mutex_t *));
         if (handleLocks == NULL) {
             return S_EVFILE_ALLOCFAIL;
         }
         /* Initialize new array of mutexes */
         for (i=0; i < handleCount; i++) {
-            pthread_rwlock_t *plock = (pthread_rwlock_t *) calloc(1, sizeof(pthread_rwlock_t));
-            pthread_rwlock_init(plock, NULL);
+            pthread_mutex_t *plock = (pthread_mutex_t *) calloc(1, sizeof(pthread_mutex_t));
+            pthread_mutex_init(plock, NULL);
             handleLocks[i] = plock;
         }
-#endif
     }
     /* We're expanding the exiting arrays */
     else {
         /* Create new, 50% larger arrays */
-        int i, newCount = handleCount * 1.5;
-        EVFILE **newHandleList;
-#ifndef VXWORKS
-        pthread_rwlock_t **newHandleLocks;
+        int i;
+        size_t newCount = handleCount * 3 / 2;
 
-        newHandleLocks = (pthread_rwlock_t **) calloc(newCount, sizeof(pthread_rwlock_t *));
+        EVFILE **newHandleList;
+        pthread_mutex_t **newHandleLocks;
+
+        newHandleLocks = (pthread_mutex_t **) calloc(newCount, sizeof(pthread_mutex_t *));
         if (newHandleLocks == NULL) {
             return S_EVFILE_ALLOCFAIL;
         }
-#endif
-        
+
         newHandleList = (EVFILE **) calloc(newCount, sizeof(EVFILE *));
         if (newHandleList == NULL) {
             return S_EVFILE_ALLOCFAIL;
@@ -788,30 +743,24 @@ static int expandHandles()
         /* Copy old into new */
         for (i=0; i < handleCount; i++) {
             newHandleList[i]  = handleList[i];
-#ifndef VXWORKS
             newHandleLocks[i] = handleLocks[i];
-#endif
         }
 
-#ifndef VXWORKS
         /* Initialize the rest */
-        for (i=handleCount; i < newCount; i++) {
-            pthread_rwlock_t *plock = (pthread_rwlock_t *) calloc(1, sizeof(pthread_rwlock_t));
-            pthread_rwlock_init(plock, NULL);
+        for (i= (int)handleCount; i < newCount; i++) {
+            pthread_mutex_t *plock = (pthread_mutex_t *) calloc(1, sizeof(pthread_mutex_t));
+            pthread_mutex_init(plock, NULL);
             newHandleLocks[i] = plock;
         }
         
         /* Free the unused arrays */
         free((void *)handleLocks);
-#endif
         free((void *)handleList);
 
         /* Update variables */
         handleCount = newCount;
         handleList  = newHandleList;
-#ifndef VXWORKS
         handleLocks = newHandleLocks;
-#endif
     }
 
     return S_SUCCESS;
@@ -840,7 +789,7 @@ static int tcpWrite(int fd, const void *vptr, int n)
     nleft = n;
   
     while (nleft > 0) {
-        if ( (nwritten = write(fd, (char*)ptr, nleft)) <= 0) {
+        if ( (nwritten = (int) write(fd, (char*)ptr, nleft)) <= 0) {
             if (errno == EINTR) {
                 nwritten = 0;       /* and call write() again */
             }
@@ -879,7 +828,7 @@ static int tcpRead(int fd, void *vptr, int n)
     nleft = n;
   
     while (nleft > 0) {
-        if ( (nread = read(fd, ptr, nleft)) < 0) {
+        if ( (nread = (int) read(fd, ptr, nleft)) < 0) {
             /*
             if (errno == EINTR)            fprintf(stderr, "call interrupted\n");
             else if (errno == EAGAIN)      fprintf(stderr, "non-blocking return, or socket timeout\n");
@@ -922,7 +871,8 @@ static int tcpRead(int fd, void *vptr, int n)
  * @return     NULL if no meaningful string can be returned
  */
 static char *evTrim(char *s, int skip) {
-    int i, len, frontCount=0;
+    int i;
+    size_t len, frontCount=0;
     char *firstChar, *lastChar;
 
     
@@ -971,7 +921,7 @@ static char *evTrim(char *s, int skip) {
  * @return 1 if it exists, else 0
  */
 static int fileExists(char *filename) {
-    FILE *fp = fopen("filename","r");
+    FILE *fp = fopen(filename,"r");
     if (fp) {
         /* exists */
         fclose(fp);
@@ -1281,12 +1231,12 @@ char *evStrRemoveSpecifiers(const char *orig) {
         pChar++;
 
         /* # of chars in specifier */
-        specLen = pChar - pSpec;
+        specLen = (int) (pChar - pSpec);
         if (debug) printf("         spec len = %d\n", specLen);
 
         /* shift chars to eliminate specifier */
-        startIndex = pSpec-pStart;
-        endIndex = strlen(result) + 1 - specLen - startIndex; /* include NULL in move */
+        startIndex = (int) (pSpec-pStart);
+        endIndex = (int) strlen(result) + 1 - specLen - startIndex; /* include NULL in move */
         for (i=0; i < endIndex; i++) {
             result[i+startIndex] = result[i+startIndex+specLen];
         }
@@ -1384,44 +1334,53 @@ int evGenerateBaseFileName(char *origName, char **baseName, int *count) {
  * If the file is being split, the second will be substituted with the splitNumber.
  * If 2 specifiers exist and the file is not being split, no substitutions are made.
  * If no specifier for the splitNumber exists, it is tacked onto the end of the file name.
- * It returns the final file name or NULL if error. Free the result if non-NULL.
+ * It returns the final file name or NULL if error. Free the result if non-NULL.<p>
+ *
+ * If multiple streams of data, each writing a file, end up with the same file name,
+ * they can be differentiated by a stream id number. If the id is > 0, the string, ".strm"
+ * is appended to the very end of the file followed by the id number (e.g. filename.strm1).
+ * This is done after the run type, run number, split numbers, and env vars have been inserted
+ * into the file name.<p>
  *
  * @param handle         evio handle (contains file name to use as a basis for the
  *                       generated file name)
  * @param specifierCount number of C-style int format specifiers in file name arg
  * @param runNumber      CODA run number
- * @param split          number of bytes at which to split off evio file (<= 0 if not)
+ * @param split          is file being split (split > 0)? 1 - yes, 0 - no
  * @param splitNumber    number of the split file
  * @param runType        run type name
+ * @param streamId       streamId number (100 > id > -1)
  *
  * @return NULL if error
  * @return generated file name (free if non-NULL)
  */
 char *evGenerateFileName(EVFILE *a, int specifierCount, int runNumber,
-                         int split, int splitNumber, char *runType) {
+                         int splitting, int splitNumber, char *runType,
+                         uint32_t streamId) {
 
     char   *fileName, *name, *specifier;
 
     
     /* Check args */
-    if ( (split > 0 && splitNumber < 0) || (runNumber < 1) ||
+    if ( (splitting && splitNumber < 0) || (runNumber < 1) ||
+         (streamId > 99) ||
          (specifierCount < 0) || (specifierCount > 2)) {
-        return(NULL); /* S_EVFILE_BADARG */
+        return(NULL);
     }
 
     /* Check handle arg */
     if (a == NULL) {
-        return(NULL); /* S_EVFILE_BADHANDLE */
+        return(NULL);
     }
 
     /* Need to be writing to a file */
     if (a->rw != EV_WRITEFILE) {
-        return(NULL); /* S_EVFILE_BADMODE */
+        return(NULL);
     }
 
     /* Internal programming bug */
     if (a->baseFileName == NULL) {
-        return(NULL); /* S_FAILURE */
+        return(NULL);
     }
     
     /* Replace all %s occurrences with run type ("" if NULL).
@@ -1429,7 +1388,7 @@ char *evGenerateFileName(EVFILE *a, int specifierCount, int runNumber,
     name = evStrReplace(a->baseFileName, "%s", runType);
     if (name == NULL) {
         /* out-of-mem */
-        return(NULL); /* S_FAILURE */
+        return(NULL);
     }
     free(a->baseFileName);
     a->baseFileName = name;
@@ -1438,17 +1397,17 @@ char *evGenerateFileName(EVFILE *a, int specifierCount, int runNumber,
      * That will cover 32 bit ints. */
 
     /* If we're splitting files ... */
-    if (split > 0) {
+    if (splitting) {
         
         /* For no specifiers: tack split # on end of base file name */
         if (specifierCount < 1) {
             /* Create space for filename */
             fileName = (char *)calloc(1, strlen(a->baseFileName) + 12);
-            if (!fileName) return(NULL); /* S_FAILURE */
+            if (!fileName) return(NULL);
             
             /* Create a printing format specifier for split # */
             specifier = (char *)calloc(1, strlen(a->baseFileName) + 6);
-            if (!specifier) return(NULL); /* S_FAILURE */
+            if (!specifier) return(NULL);
             
             sprintf(specifier, "%s.%s", a->baseFileName, "%d");
 
@@ -1461,13 +1420,13 @@ char *evGenerateFileName(EVFILE *a, int specifierCount, int runNumber,
         else if (specifierCount == 1) {
             /* Create space for filename */
             fileName = (char *)calloc(1, strlen(a->baseFileName) + 22);
-            if (!fileName) return(NULL); /* S_FAILURE */
+            if (!fileName) return(NULL);
             
             /* The first printfing format specifier is in a->filename already */
             
             /* Create a printing format specifier for split # */
             specifier = (char *)calloc(1, strlen(a->baseFileName) + 6);
-            if (!specifier) return(NULL); /* S_FAILURE */
+            if (!specifier) return(NULL);
             
             sprintf(specifier, "%s.%s", a->baseFileName, "%d");
 
@@ -1480,7 +1439,7 @@ char *evGenerateFileName(EVFILE *a, int specifierCount, int runNumber,
         else {
             /* Create space for filename */
             fileName = (char *)calloc(1, strlen(a->baseFileName) + 21);
-            if (!fileName) return(NULL); /* S_FAILURE */
+            if (!fileName) return(NULL);
             
             /* Both printfing format specifiers are in a->filename already */
                         
@@ -1494,7 +1453,7 @@ char *evGenerateFileName(EVFILE *a, int specifierCount, int runNumber,
         if (specifierCount == 1) {
             /* Create space for filename */
             fileName = (char *)calloc(1, strlen(a->baseFileName) + 11);
-            if (!fileName) return(NULL); /* S_FAILURE */
+            if (!fileName) return(NULL);
             
             /* The printfing format specifier is in a->filename already */
                         
@@ -1504,7 +1463,7 @@ char *evGenerateFileName(EVFILE *a, int specifierCount, int runNumber,
         /* For 2 specifiers: insert run # and remove split # specifier */
         else if (specifierCount == 2) {
             fileName = (char *)calloc(1, strlen(a->baseFileName) + 11);
-            if (!fileName) return(NULL); /* S_FAILURE */
+            if (!fileName) return(NULL);
             sprintf(fileName, a->baseFileName, runNumber);
 
             /* Get rid of remaining int specifiers */
@@ -1517,33 +1476,37 @@ char *evGenerateFileName(EVFILE *a, int specifierCount, int runNumber,
         }
     }
 
+    /* If we have a valid stream id number, append ".strm#" to end of file name */
+    if (streamId > 0) {
+        char *fName;
+        size_t idDigits, len = strlen(fileName);
+
+        if (streamId < 10) {
+            idDigits = 1 + 5;
+        }
+        else {
+            idDigits = 2 + 5;
+        }
+
+        /* Create space for filename */
+        fName = (char *)calloc(1, len + 1 + idDigits);
+        if (!fName) return(NULL);
+
+        sprintf(fName, "%s.strm%u", fileName, streamId);
+
+        free(fileName);
+        fileName = fName;
+    }
+
     return fileName;
 }
 
 
-/** Fortran interface to {@link evOpen}. */
-#ifdef AbsoftUNIXFortran
-int evopen
-#else
-int evopen_
-#endif
-(char *filename, char *flags, int *handle, int fnlen, int flen)
-{
-    char *fn, *fl;
-    int status;
-    fn = (char *) malloc(fnlen+1);
-    strncpy(fn,filename,fnlen);
-    fn[fnlen] = 0;      /* insure filename is null terminated */
-    fl = (char *) malloc(flen+1);
-    strncpy(fl,flags,flen);
-    fl[flen] = 0;           /* insure flags is null terminated */
-    status = evOpen(fn,fl,handle);
-    free(fn);
-    free(fl);
-    return(status);
-}
-
-
+/**
+ * @defgroup open open & close routines
+ * These routines handle opening & closing the ev lib for reading or writing to a file, buffer, or socket.
+ * @{
+ */
 
 /**
  * This function opens a file for either reading or writing evio format data.
@@ -1553,9 +1516,9 @@ int evopen_
  * @param filename  name of file. Constructs of the form $(env) will be substituted
  *                  with the given environmental variable or removed if nonexistent.
  *                  Constructs of the form %s will be substituted with the run type
- *                  if specified in {@link evIoctl} or removed if nonexistent.
+ *                  if specified in {@link #evIoctl} or removed if nonexistent.
  *                  Up to 2, C-style int format specifiers are allowed. The first is
- *                  replaced with the run number (set in {@link evIoctl}). If splitting,
+ *                  replaced with the run number (set in {@link #evIoctl}). If splitting,
  *                  the second is replaced by the split number, otherwise it's removed.
  *                  If splitting and no second int specifier exists, a "." and split
  *                  number are automatically appended to the end of the file name.
@@ -1669,6 +1632,10 @@ int evOpenSocket(int sockFd, char *flags, int *handle)
     return(evOpenImpl((char *)NULL, 0, sockFd, flag, handle));
 }
 
+
+/** @} */
+
+
 /* For test purposes only ... */
 int evOpenFake(char *filename, char *flags, int *handle, char **evf)
 {
@@ -1693,7 +1660,7 @@ int evOpenFake(char *filename, char *flags, int *handle, char **evf)
     
     return(S_SUCCESS);
 }
-/**/
+
     
 /**
  * This function opens a file, socket, or buffer for either reading or writing
@@ -1721,7 +1688,7 @@ int evOpenFake(char *filename, char *flags, int *handle, char **evf)
  *                            if srcDest arg is NULL when using file or buffer;
  *                            if unrecognizable flags;
  *                            if buffer size too small when using buffer;
- *                            if specifying random access on vxWorks or Windows
+ *                            if specifying random access on Windows
  * @return S_EVFILE_ALLOCFAIL if memory allocation failed
  * @return S_EVFILE_BADFILE   if error reading file, unsupported version,
  *                            or contradictory data in file
@@ -1731,12 +1698,13 @@ int evOpenFake(char *filename, char *flags, int *handle, char **evf)
 static int evOpenImpl(char *srcDest, uint32_t bufLen, int sockFd, char *flags, int *handle)
 {
     EVFILE *a;
-    char *filename, *buffer, *baseName;
+    char *filename=NULL, *buffer=NULL, *baseName;
 
     uint32_t blk_size, temp, headerInfo, blkHdrSize, header[EV_HDSIZ];
-    uint32_t rwBufSize, bytesToRead;
+    uint32_t rwBufSize=0, bytesToRead;
 
-    int err, version, ihandle, nBytes;
+    int err, version, ihandle;
+    int64_t nBytes=0;
     int debug=0, useFile=0, useBuffer=0, useSocket=0;
     int reading=0, randomAccess=0, append=0, splitting=0, specifierCount=0;
 
@@ -1765,8 +1733,8 @@ if (debug) printf("EV_HDSIZ in evio.h set to be too small (%d). Must be >= 8.\n"
         else if (strcasecmp(flags,  "s") == 0) splitting = 1;
         else if (strcasecmp(flags, "ra") == 0) randomAccess = 1;
 
-#if defined VXWORKS || defined _MSC_VER
-        /* No random access support in vxWorks or Windows */
+#if defined _MSC_VER
+        /* No random access support in Windows */
         if (randomAccess) {
             return(S_EVFILE_BADARG);
         }
@@ -1842,8 +1810,8 @@ if (debug) printf("EV_HDSIZ in evio.h set to be too small (%d). Must be >= 8.\n"
     if (reading) {
         
         if (useFile) {
-#if defined VXWORKS || defined _MSC_VER
-            /* No pipe or zip/unzip support in vxWorks */
+#if defined _MSC_VER
+            /* No pipe or zip/unzip support in Windows */
             a->file = fopen(filename,"r");
             a->rw = EV_READFILE;
             a->randomAccess = randomAccess = 0;
@@ -1877,8 +1845,8 @@ if (debug) printf("evOpen: reading from pipe %s\n", filename + 1);
 #endif
             if (randomAccess) {
                 /* Read (copy) in header */
-                nBytes = sizeof(header);
-                memcpy((void *)header, (const void *)a->mmapFile, nBytes);
+                nBytes = (int64_t )sizeof(header);
+                memcpy((void *)header, (const void *)a->mmapFile, (size_t)nBytes);
             }
             else {
                 if (a->file == NULL) {
@@ -1889,15 +1857,54 @@ if (debug) printf("evOpen: reading from pipe %s\n", filename + 1);
                 }
 
                 /* Read in header */
-                nBytes = fread(header, 1, sizeof(header), a->file);
+                int bytesRead = 0, headerSize = sizeof(header);
+                char *pHead = (char *)header;
+                while (bytesRead < headerSize) {
+
+                    nBytes = (int64_t)fread((void *)(pHead + bytesRead), 1,
+                                            (size_t)(headerSize - bytesRead), a->file);
+                    if (nBytes < 1) {
+                        if (feof(a->file)) {
+                            free(a);
+                            *handle = 0;
+                            free(filename);
+                            return(EOF);
+                        }
+                        else if (ferror(a->file)) {
+                            /* errno is not set for ferror */
+                            free(a);
+                            *handle = 0;
+                            free(filename);
+                            return(S_FAILURE);
+                        }
+                    }
+                    bytesRead += nBytes;
+                }
+
+                a->filePosition += headerSize;
             }
+
+            {
+                /* Find the size of the file just opened for reading */
+                int fd = fileno(a->file);
+                struct stat fstatBuf;
+                err = fstat(fd, &fstatBuf);
+                if (err != 0) {
+                    free(a);
+                    *handle = 0;
+                    free(filename);
+                    return(errno);
+                }
+                a->fileSize = (uint64_t) fstatBuf.st_size;
+            }
+
         }
         else if (useSocket) {
             a->sockFd = sockFd;
             a->rw = EV_READSOCK;
             
             /* Read in header */
-            nBytes = tcpRead(sockFd, header, sizeof(header));
+            nBytes = (int64_t)tcpRead(sockFd, header, sizeof(header));
             if (nBytes < 0) return(errno);
         }
         else if (useBuffer) {
@@ -1906,9 +1913,9 @@ if (debug) printf("evOpen: reading from pipe %s\n", filename + 1);
             a->rwBufSize = rwBufSize;
             
             /* Read (copy) in header */
-            nBytes = sizeof(header);
+            nBytes = (int64_t)sizeof(header);
 //TODO: get rid of this copy!
-            memcpy((void *)header, (const void *)(a->rwBuf), nBytes);
+            memcpy((void *)header, (const void *)(a->rwBuf), (size_t)nBytes);
             a->rwBytesIn += nBytes;
         }
 
@@ -1933,7 +1940,6 @@ if (debug) {
                 localClose(a);
                 free(filename);
             }
-            structDestroy(a);
             free(a);
             return(S_EVFILE_BADFILE);
         }
@@ -1950,7 +1956,6 @@ if (debug) printf("Magic # is a bad value\n");
                     localClose(a);
                     free(filename);
                 }
-                structDestroy(a);
                 free(a);
                 return(S_EVFILE_BADFILE);
             }
@@ -1972,7 +1977,6 @@ if (debug) printf("Header has unsupported evio version (%d), quit\n", version);
                 localClose(a);
                 free(filename);
             }
-            structDestroy(a);
             free(a);
             return(S_EVFILE_BADFILE);
         }
@@ -1994,7 +1998,6 @@ if (debug) printf("Header size is too small (%u), return error\n", blkHdrSize);
                     localClose(a);
                     free(filename);
                 }
-                structDestroy(a);
                 free(a);
                 return(S_EVFILE_BADFILE);
             }
@@ -2024,9 +2027,16 @@ if (debug) printf("Header size is too small (%u), return error\n", blkHdrSize);
             }
             a->blksiz = blk_size;
 
-            /* How big do we make this buffer? Use a minimum size. */
-            a->bufSize = blk_size < EV_BLOCKSIZE_MIN ? EV_BLOCKSIZE_MIN : blk_size;
-            a->buf = (uint32_t *)malloc(4*a->bufSize);
+            if (useFile && version < 4) {
+                // Read early version files in big chunks, integral multiples of a block
+                a->bufSize = EV_READ_BYTES_V3;
+                a->pBuf = a->buf = (uint32_t *) malloc(EV_READ_BYTES_V3);
+            }
+            else {
+                /* How big do we make this buffer? Use a minimum size. */
+                a->bufSize = blk_size < EV_BLOCKSIZE_MIN ? EV_BLOCKSIZE_MIN : blk_size;
+                a->buf = (uint32_t *) malloc(4 * a->bufSize);
+            }
     
             /* Error if can't allocate buffer memory */
             if (a->buf == NULL) {
@@ -2034,14 +2044,13 @@ if (debug) printf("Header size is too small (%u), return error\n", blkHdrSize);
                     localClose(a);
                     free(filename);
                 }
-                structDestroy(a);
                 free(a);
                 return(S_EVFILE_ALLOCFAIL);
             }
     
             /* Copy header (the part we read in) into block (swapping if necessary) */
             if (a->byte_swapped) {
-                swap_int32_t((uint32_t *)header, EV_HDSIZ, (uint32_t *)a->buf);
+                swap_int32_t((uint32_t *)header, EV_HDSIZ, a->buf);
             }
             else {
                 memcpy(a->buf, header, 4*EV_HDSIZ);
@@ -2051,11 +2060,62 @@ if (debug) printf("Header size is too small (%u), return error\n", blkHdrSize);
             /* Read rest of block & any remaining, over-sized header */
             /*********************************************************/
             bytesToRead = 4*(blk_size - EV_HDSIZ);
+
             if (useFile) {
-                nBytes = fread(a->buf+EV_HDSIZ, 1, bytesToRead, a->file);
+                if (version > 3) {
+                    nBytes = (int64_t) fread(a->buf + EV_HDSIZ, 1, bytesToRead, a->file);
+                }
+                else {
+                    // We already read in the header. Take that into account when
+                    // reading in next blocks.
+                    long bytesLeftInFile = a->fileSize - a->filePosition;
+                    bytesToRead = (EV_READ_BYTES_V3 - 32) < bytesLeftInFile ?
+                                  (EV_READ_BYTES_V3 - 32) : (uint32_t) bytesLeftInFile;
+
+                    if ( (a->fileSize % 32768) != 0) {
+fprintf(stderr,"evOpenImpl: file is NOT integral # of 32K blocks!\n");
+                        localClose(a);
+                        free(filename);
+                        free(a->buf);
+                        free(a);
+                        return (S_FAILURE);
+                    }
+
+                    uint32_t bytesRead = 0;
+                    char *pBuf = (char *)a->buf;
+
+                    while (bytesRead < bytesToRead) {
+                        nBytes = (int64_t) fread((void *)(pBuf + 32 + bytesRead), 1,
+                                                 (size_t) (bytesToRead - bytesRead), a->file);
+                        if (nBytes < 1) {
+                            if (feof(a->file)) {
+                                localClose(a);
+                                free(filename);
+                                free(a->buf);
+                                free(a);
+                                return (EOF);
+                            }
+                            else if (ferror(a->file)) {
+                                /* errno is not set for ferror */
+                                localClose(a);
+                                free(filename);
+                                free(a->buf);
+                                free(a);
+                                return (S_FAILURE);
+                            }
+                        }
+                        bytesRead += nBytes;
+                    }
+
+                    a->filePosition += bytesRead;
+
+                    // Set blocks just read in that are not being parsed right now.
+                    // We're parsing the very first hence the "- 1".
+                    a->blocksToParse = (bytesRead + 32)/32768 - 1;
+                }
             }
             else if (useSocket) {
-                nBytes = tcpRead(sockFd, a->buf+EV_HDSIZ, bytesToRead);
+                nBytes = (int64_t)tcpRead(sockFd, a->buf+EV_HDSIZ, bytesToRead);
                 if (nBytes < 0) {
                     free(a->buf);
                     free(a);
@@ -2064,7 +2124,7 @@ if (debug) printf("Header size is too small (%u), return error\n", blkHdrSize);
             }
             else if (useBuffer) {
                 nBytes = bytesToRead;
-                memcpy(a->buf+EV_HDSIZ, (a->rwBuf + a->rwBytesIn), bytesToRead);
+                memcpy(a->buf+EV_HDSIZ, (a->rwBuf + a->rwBytesIn), (size_t)bytesToRead);
                 a->rwBytesIn += bytesToRead;
             }
     
@@ -2074,7 +2134,6 @@ if (debug) printf("Header size is too small (%u), return error\n", blkHdrSize);
                     localClose(a);
                     free(filename);
                 }            
-                structDestroy(a);
                 free(a->buf);
                 free(a);
                 return(S_EVFILE_BADFILE);
@@ -2114,6 +2173,9 @@ printf("ERROR retrieving DICTIONARY, status = %#.8x\n", status);
                     }
                 }
             }
+
+            /* Store general info in handle structure */
+            a->blknum = a->buf[EV_HD_BLKNUM];
         }
     }
         
@@ -2125,7 +2187,7 @@ printf("ERROR retrieving DICTIONARY, status = %#.8x\n", status);
         a->append = append;
 
         if (useFile) {
-#if defined  VXWORKS || defined _MSC_VER
+#if defined _MSC_VER
             a->fileName = strdup(filename);
             a->file = fopen(filename,"w");
             a->rw = EV_WRITEFILE;
@@ -2147,7 +2209,7 @@ if (debug) printf("evOpen: writing to pipe %s\n", filename + 1);
                 a->file = fopen(filename,"r+");
                 
                 /* Read in header */
-                nBytes = sizeof(header)*fread(header, sizeof(header), 1, a->file);
+                nBytes = (int64_t)(sizeof(header)*fread(header, sizeof(header), 1, a->file));
                 
                 /* Check to see if read the whole header */
                 if (nBytes != sizeof(header)) {
@@ -2190,7 +2252,7 @@ if (debug) printf("evOpen: writing to pipe %s\n", filename + 1);
                     return(S_EVFILE_UNXPTDEOF);
                 }
                 /* Read (copy) in header */
-                memcpy(header, a->rwBuf, nBytes);
+                memcpy(header, a->rwBuf, (size_t)nBytes);
             }
         }
 
@@ -2240,6 +2302,9 @@ if (debug) printf("File must be evio version %d (not %d) for append mode, quit\n
                 free(a);
                 return(S_EVFILE_BADFILE);
             }
+
+            /* Is there a dictionary? */
+            a->hasAppendDictionary = headerInfo & EV_DICTIONARY_MASK ? 1 : 0;
         }
         
         /* Allocate memory for a block only if we are not writing to a buffer. */
@@ -2262,8 +2327,8 @@ if (debug) printf("File must be evio version %d (not %d) for append mode, quit\n
                 return(S_EVFILE_ALLOCFAIL);
             }
 
-            /* Initialize block header (as last block) */
-            initLastBlockHeader(a->buf, 1);
+            /* Initialize block header */
+            initBlockHeader2(a->buf, 1);
         }
         /* If writing to buffer, skip step of writing to separate block buffer first. */
         else {
@@ -2273,9 +2338,8 @@ if (debug) printf("File must be evio version %d (not %d) for append mode, quit\n
                 /* Block header is at beginning of buffer */
                 a->buf = (uint32_t*) a->rwBuf;
 
-                /* Initialize block header as the last one to be written */
-                initLastBlockHeader(a->buf, 1);
-                a->isLastBlock  = 1;
+                /* Initialize block header */
+                initBlockHeader2(a->buf, 1);
 
                 /* # of bytes "written" - just the block header so far */
                 a->rwBytesOut = 4*EV_HDSIZ;
@@ -2295,10 +2359,11 @@ if (debug) printf("File must be evio version %d (not %d) for append mode, quit\n
          * first event header will be right after first block header. */
         a->next = a->buf + EV_HDSIZ;
 
+        /* Get ready to write the next block */
+        a->blknum++;
+
     } /* if writing */
-    
-    /* Store general info in handle structure */
-    if (!randomAccess) a->blknum = a->buf[EV_HD_BLKNUM];
+
 
     /* Don't let no one else get no "a" while we're openin' somethin' */
     getHandleLock();
@@ -2326,7 +2391,7 @@ if (debug) printf("File must be evio version %d (not %d) for append mode, quit\n
         /* If no available handles left ... */
         if (!gotHandle) {
             /* Remember old handle count */
-            int oldHandleLimit = handleCount;
+            int oldHandleLimit = (int) handleCount;
             /* Create 50% more handles (and increase handleCount) */
             expandHandles();
 
@@ -2380,9 +2445,7 @@ static void localClose(EVFILE *a)
  * @return S_SUCCESS   if successful
  * @return S_FAILURE   if failure to open or memory map file (errno is set)
  */
-static int memoryMapFile(EVFILE *a, const char *fileName)
-{
-#ifndef VXWORKS
+static int memoryMapFile(EVFILE *a, const char *fileName) {
     int        fd;
     uint32_t   *pmem;
     size_t      fileSize;
@@ -2414,7 +2477,7 @@ static int memoryMapFile(EVFILE *a, const char *fileName)
   
     a->mmapFile = pmem;
     a->mmapFileSize = fileSize;
-#endif
+
     return(S_SUCCESS);
 }
 
@@ -2440,8 +2503,8 @@ static int memoryMapFile(EVFILE *a, const char *fileName)
 static int getEventCount(EVFILE *a, uint32_t *count)
 {
     int        i, usingBuffer = 0, nBytes;
-    ssize_t    startingPosition;
-    uint32_t   bytesUsed, blockEventCount, blockSize, blockHeaderSize, header[EV_HDSIZ];
+    ssize_t    startingPosition=0;
+    uint32_t   bytesUsed=0, blockEventCount, blockSize, blockHeaderSize, header[EV_HDSIZ];
 
     
     /* Already protected with read lock since it's called only by evIoctl */
@@ -2505,7 +2568,7 @@ static int getEventCount(EVFILE *a, uint32_t *count)
             memcpy(header, (a->rwBuf + bytesUsed), 4*EV_HDSIZ);
         }
         else {
-            nBytes = sizeof(header)*fread(header, sizeof(header), 1, a->file);
+            nBytes = (int) (sizeof(header)*fread(header, sizeof(header), 1, a->file));
                 
             /* Check to see if we read the whole header */
             if (nBytes != sizeof(header)) {
@@ -2674,7 +2737,7 @@ static int generatePointerTable(EVFILE *a)
 }
 
 /**
- * This function positions a file or buffer for the first {@link evWrite}
+ * This function positions a file or buffer for the first {@link #evWrite}
  * in append mode. It makes sure that the last block header is an empty one
  * with its "last block" bit set.
  *
@@ -2687,17 +2750,15 @@ static int generatePointerTable(EVFILE *a)
  *                            while reading data (perhaps bad block header)
  * @return errno              if any file seeking/writing errors
  */
-static int toAppendPosition(EVFILE *a)
-{
-    int         debug=0, usingBuffer=0;
-    uint32_t    nBytes, bytesToWrite;
-    uint32_t   *pmem, sixthWord, header[EV_HDSIZ], *pHeader;
-    uint32_t    blockBitInfo, blockEventCount, blockSize, blockHeaderSize, blockNumber=1;
-    
-    
+static int toAppendPosition(EVFILE *a) {
+    int debug = 0, usingBuffer=0, readEOF=0;
+    uint32_t nBytes, *pmem, sixthWord, header[EV_HDSIZ], *pHeader;
+    uint32_t blockBitInfo, blockEventCount, blockSize, blockHeaderSize, blockNumber = 1;
+
+
     /* Only for append mode */
     if (!a->append) {
-        return(S_SUCCESS);
+        return (S_SUCCESS);
     }
 
     if (a->rw == EV_WRITEBUF) {
@@ -2706,11 +2767,11 @@ static int toAppendPosition(EVFILE *a)
 
     if (usingBuffer) {
         /* Go to back to beginning of buffer */
-        a->rwBytesOut  = 0;  /* # bytes written to rwBuf so far (after each evWrite) */
+        a->rwBytesOut = 0;  /* # bytes written to rwBuf so far (after each evWrite) */
     }
-    else {
-        /* Go to back to beginning of file */
-        if (fseek(a->file, 0L, SEEK_SET) < 0) return(errno);
+    /* Go to back to beginning of file */
+    else if (fseek(a->file, 0L, SEEK_SET) < 0) {
+        return (errno);
     }
 
     while (1) {
@@ -2719,77 +2780,122 @@ static int toAppendPosition(EVFILE *a)
             /* Is there enough data to read in header? */
             if (a->rwBufSize - a->rwBytesOut < sizeof(header)) {
                 /* unexpected EOF or end-of-buffer in this case */
-                return(S_EVFILE_UNXPTDEOF);
+                return (S_EVFILE_UNXPTDEOF);
             }
 
             /* Look for block header info here */
             a->buf = pHeader = (uint32_t *) (a->rwBuf + a->rwBytesOut);
 
-            blockBitInfo    = pHeader[EV_HD_VER];
-            blockSize       = pHeader[EV_HD_BLKSIZ];
+            blockBitInfo = pHeader[EV_HD_VER];
+            blockSize = pHeader[EV_HD_BLKSIZ];
             blockHeaderSize = pHeader[EV_HD_HDSIZ];
             blockEventCount = pHeader[EV_HD_COUNT];
-            
+
             /* Swap header if necessary */
             if (a->byte_swapped) {
-                blockBitInfo    = EVIO_SWAP32(blockBitInfo);
-                blockSize       = EVIO_SWAP32(blockSize);
+                blockBitInfo = EVIO_SWAP32(blockBitInfo);
+                blockSize = EVIO_SWAP32(blockSize);
                 blockHeaderSize = EVIO_SWAP32(blockHeaderSize);
                 blockEventCount = EVIO_SWAP32(blockEventCount);
             }
         }
         else {
-            nBytes = sizeof(header)*fread(header, sizeof(header), 1, a->file);
-                
-            /* Check to see if we read the whole header */
-            if (nBytes != sizeof(header)) {
-                return(S_EVFILE_BADFILE);
+            nBytes = 0;
+            size_t bytesToRead = sizeof(header);
+
+            /* It may take more than one fread to read all data */
+            while (nBytes < bytesToRead) {
+                char *pBuf = (char *)(header) + nBytes;
+                /* Read from file */
+                nBytes += fread((void *)pBuf, 1, bytesToRead - nBytes, a->file);
+
+                /* If End-Of-File ... */
+                if (feof(a->file)) {
+                    /* clears EOF */
+                    clearerr(a->file);
+
+                    /* If we can only read a partial header, evio format error */
+                    if (nBytes > 0) {
+                        return(S_EVFILE_BADFILE);
+                    }
+
+                    /* If here, there's no header to read, file must have ended
+                     * just after a regular block, That's OK, we can continue. */
+                    readEOF = 1;
+                }
+                /* Return for error condition of file stream */
+                else if (ferror(a->file)) {
+                    return(S_EVFILE_BADFILE);
+                }
             }
-            
+
             /* Swap header if necessary */
             if (a->byte_swapped) {
                 swap_int32_t(header, EV_HDSIZ, NULL);
             }
 
             /* Look at block header to get info */
-            blockBitInfo    = header[EV_HD_VER];
-            blockSize       = header[EV_HD_BLKSIZ];
+            blockBitInfo = header[EV_HD_VER];
+            blockSize = header[EV_HD_BLKSIZ];
             blockHeaderSize = header[EV_HD_HDSIZ];
             blockEventCount = header[EV_HD_COUNT];
         }
-        
+
         /* Add to the number of events */
         a->eventCount += blockEventCount;
 
         /* Next block has this number. */
         blockNumber++;
 
-        /* Stop at the last block */
-        if (isLastBlockInt(blockBitInfo)) {
+        // Stop at the last block. The file may not have a last block if
+        // improperly terminated. Running into an End-Of-File will flag
+        // this condition.
+        if (isLastBlockInt(blockBitInfo) || readEOF) {
             break;
         }
 
         /* Hop to next block header */
         if (usingBuffer) {
             /* Is there enough buffer space to hop over block? */
-            if (a->rwBufSize - a->rwBytesOut < 4*blockSize) {
+            if (a->rwBufSize - a->rwBytesOut < 4 * blockSize) {
                 /* unexpected EOF or end-of-buffer in this case */
-                return(S_EVFILE_UNXPTDEOF);
+                return (S_EVFILE_UNXPTDEOF);
             }
-            a->rwBytesOut += 4*blockSize;
+            a->rwBytesOut += 4 * blockSize;
         }
         else {
-            if (fseek(a->file, 4*(blockSize-EV_HDSIZ), SEEK_CUR) < 0) return(errno);
+            if (fseek(a->file, 4 * (blockSize - EV_HDSIZ), SEEK_CUR) < 0) return (errno);
         }
     }
 
-    /* If we're here, we've just read the last block header (at least EV_HDSIZ words of it).
-     * Easiest to rewrite it in our own image at this point. But first we
-     * must check to see if the last block contains data. If it does, we
-     * change a bit so it's not labeled as the last block. Then we write
-     * an empty last block after the data. If, on the other hand, this
-     * last block contains no data, just write over it with a new one. */
-    if (blockSize > blockHeaderSize) {
+    if (a->hasAppendDictionary) {
+        a->eventsToFile = a->eventsToBuf = a->eventCount + 1;
+    }
+    else {
+        a->eventsToFile = a->eventsToBuf = a->eventCount;
+    }
+
+    /*-------------------------------------------------------------------------------
+     * If we're here, we've just read the last block header (at least 8 words of it).
+     * File position is just past header, but buffer position is just before it.
+     * Either that or we ran into end of file (last block header missing).
+     *
+     * If EOF, last block header missing, we're good.
+     *
+     * Else check to see if the last block contains data. If it does,
+     * change a single bit so it's not labeled as the last block,
+     * then jump past all data.
+     *
+     * Else if there is no data, position file before it as preparation for writing
+     * the next block.
+     *-------------------------------------------------------------------------------*/
+    /* If no last, empty block header in file ... */
+    if (readEOF) {
+        /* It turns out we need to do nothing. The function that
+         * calls this method will write out the next block header. */
+        blockNumber--;
+    }
+    else if (blockSize > blockHeaderSize) {
         /* Clear last block bit in 6th header word */
         sixthWord = clearLastBlockBitInt(blockBitInfo);
         
@@ -2845,47 +2951,14 @@ if (debug) printf("toAppendPosition: last block had no data, back up 1 header to
         }
     }
 
-    /* Write empty last block header. This function gets called right after
+    /* This function gets called right after
      * the handle's block header memory is initialized and other members of
      * the handle structure are also initialized. Some of the values need to
      * be set properly here - like the block number - since we've skipped over
      * all existing blocks. */
     a->buf[EV_HD_BLKNUM] = blockNumber;
-    a->blknum = blockNumber + 1;
-    
-    /* Mark this block as the last one to be written. */
-    setLastBlockBit(a->buf);
-    a->isLastBlock = 1;
+    a->blknum = blockNumber;
 
-    a->buf[EV_HD_BLKSIZ] = EV_HDSIZ;
-    bytesToWrite = 4*EV_HDSIZ;
-
-    if (usingBuffer) {
-        nBytes = bytesToWrite;
-        /* How many bytes ended up in the buffer we're writing to? */
-        a->rwBytesOut += bytesToWrite;
-    }
-    else {
-        long ppos;
-        
-        /* Clear EOF and error indicators for file stream */
-        clearerr(a->file);
-        /* This last block is always EV_HDSIZ ints long. */
-        nBytes = fwrite((const void *)a->buf, 1, bytesToWrite, a->file);
-        /* Return any error condition of file stream */
-        if (ferror(a->file)) return(ferror(a->file));
-
-        /* Now that the ending header is in the file, back up and
-         * prepare to write over it with whatever is coming next. */
-        if (fseek(a->file, -4*EV_HDSIZ, SEEK_CUR) < 0) return(errno);
-        ppos = ftell(a->file);
-if (debug) printf("toAppendPosition: prepare to write, back up 1 header to pos = %ld (%ld words)\n", ppos, ppos/4);
-
-    }
-
-    /* Return any error condition of write attempt */
-    if (nBytes != bytesToWrite) return(errno);
-       
     /* We should now be in a state identical to that if we had
      * just now written everything currently in the file/buffer. */
 
@@ -2894,9 +2967,101 @@ if (debug) printf("toAppendPosition: prepare to write, back up 1 header to pos =
 
 
 /**
+ * This routine reads an evio bank from an evio format file
+ * opened with routine {@link #evOpen}, allocates a buffer and fills it with the bank.
+ * Works with versions 1-3 of evio. A status is returned. Caller will need
+ * to free buffer to avoid a memory leak.
+ *
+ * @param a      pointer to handle structure
+ * @param buffer pointer to pointer to buffer gets filled with
+ *               pointer to allocated buffer (caller must free)
+ * @param buflen pointer to int gets filled with length of buffer in 32 bit words
+ *               including the full (8 byte) header
+ *
+ * @return S_SUCCESS          if successful
+ * @return S_EVFILE_BADMODE   if opened for writing or random-access reading
+ * @return S_EVFILE_BADARG    if buffer or buflen is NULL
+ * @return S_EVFILE_ALLOCFAIL if memory cannot be allocated
+ * @return S_EVFILE_UNXPTDEOF if unexpected EOF or end-of-valid-data
+ *                            while reading data (perhaps bad     block header)
+ * @return EOF                if end-of-file or end-of-valid-data reached
+ * @return errno              if file/socket read error
+ * @return stream error       if file stream error
+ */
+static int evReadAllocImplFileV3(EVFILE *a, uint32_t **buffer, uint32_t *buflen)
+{
+    uint32_t *buf, *pBuf;
+    int       status;
+    uint32_t  nleft, ncopy, len;
+
+
+    /* If no more data left to read from current block, get a new block */
+    if (a->left < 1) {
+        status = evGetNewBufferFileV3(a);
+        if (status != S_SUCCESS) {
+            return(status);
+        }
+    }
+
+    /* Find number of words to read in next event (including header) */
+    if (a->byte_swapped) {
+        /* Value at pointer to next event (bank) header = length of bank - 1 */
+        nleft = EVIO_SWAP32(*(a->next)) + 1;
+    }
+    else {
+        /* Length of next bank, including header, in 32 bit words */
+        nleft = *(a->next) + 1;
+    }
+
+    /* Allocate buffer for event */
+    len = nleft;
+    buf = pBuf = (uint32_t *)malloc(4*len);
+    if (buf == NULL) {
+        return(S_EVFILE_ALLOCFAIL);
+    }
+
+    /* While there is more event data left to read ... */
+    while (nleft > 0) {
+
+        /* If no more data left to read from current block, get a new block */
+        if (a->left < 1) {
+            status = evGetNewBufferFileV3(a);
+            if (status != S_SUCCESS) {
+                if (buf != NULL) free(buf);
+                return(status);
+            }
+        }
+
+        /* If # words left to read in event <= # words left in block,
+         * copy # words left to read in event to buffer, else
+         * copy # left in block to buffer.*/
+        ncopy = (nleft <= a->left) ? nleft : a->left;
+
+        memcpy(pBuf, a->next, ncopy*4);
+
+        pBuf    += ncopy;
+        nleft   -= ncopy;
+        a->next += ncopy;
+        a->left -= ncopy;
+    }
+
+    /* Swap event in place if necessary */
+    if (a->byte_swapped) {
+        evioswap(buf, 1, NULL);
+    }
+
+    /* Return allocated buffer with event inside and its inclusive len (with full header) */
+    *buffer = buf;
+    *buflen = len;
+
+    return(S_SUCCESS);
+}
+
+
+/**
  * This routine reads an evio bank from an evio format file/socket/buffer
- * opened with routines {@link evOpen}, {@link evOpenBuffer}, or
- * {@link evOpenSocket}, allocates a buffer and fills it with the bank.
+ * opened with routines {@link #evOpen}, {@link #evOpenBuffer}, or
+ * {@link #evOpenSocket}, allocates a buffer and fills it with the bank.
  * Works with all versions of evio. A status is returned. Caller will need
  * to free buffer to avoid a memory leak.
  *
@@ -2939,14 +3104,14 @@ static int evReadAllocImpl(EVFILE *a, uint32_t **buffer, uint32_t *buflen)
         return(S_EVFILE_BADMODE);
     }
 
-    /* Lock mutex for multithreaded reads/writes/access */
-    mutexLock(a);
-    
+    if (a->version < 4 && a->rw == EV_READFILE) {
+        return evReadAllocImplFileV3(a, buffer, buflen);
+    }
+
     /* If no more data left to read from current block, get a new block */
     if (a->left < 1) {
         status = evGetNewBuffer(a);
         if (status != S_SUCCESS) {
-            mutexUnlock(a);
             return(status);
         }
     }
@@ -2965,7 +3130,6 @@ static int evReadAllocImpl(EVFILE *a, uint32_t **buffer, uint32_t *buflen)
     len = nleft;
     buf = pBuf = (uint32_t *)malloc(4*len);
     if (buf == NULL) {
-        mutexUnlock(a);
         return(S_EVFILE_ALLOCFAIL);
     }
 
@@ -2977,7 +3141,6 @@ static int evReadAllocImpl(EVFILE *a, uint32_t **buffer, uint32_t *buflen)
             status = evGetNewBuffer(a);
             if (status != S_SUCCESS) {
                 if (buf != NULL) free(buf);
-                mutexUnlock(a);
                 return(status);
             }
         }
@@ -2995,9 +3158,6 @@ static int evReadAllocImpl(EVFILE *a, uint32_t **buffer, uint32_t *buflen)
         a->left -= ncopy;
     }
 
-    /* Unlock mutex for multithreaded reads/writes/access */
-    mutexUnlock(a);
-
     /* Swap event in place if necessary */
     if (a->byte_swapped) {
         evioswap(buf, 1, NULL);
@@ -3011,75 +3171,146 @@ static int evReadAllocImpl(EVFILE *a, uint32_t **buffer, uint32_t *buflen)
 }
 
 
+
+
+
 /**
- * This routine reads an evio bank from an evio format file/socket/buffer
- * opened with routines {@link evOpen}, {@link evOpenBuffer}, or
- * {@link evOpenSocket}, allocates a buffer and fills it with the bank.
- * Works with all versions of evio. A status is returned.
+ * @defgroup read read routines
+ * These routines handle opening the ev lib for reading from a file, buffer, or socket.
+ * @{
+ */
+
+
+/**
+ * Routine to get the next block if reading version 1-3 files.
  *
- * @param handle evio handle
- * @param buffer pointer to pointer to buffer gets filled with
- *               pointer to allocated buffer (caller must free)
- * @param buflen pointer to int gets filled with length of buffer in 32 bit words
- *               including the full (8 byte) bank header
+ * @param a pointer to file structure
  *
  * @return S_SUCCESS          if successful
- * @return S_EVFILE_BADMODE   if opened for writing or random-access reading
- * @return S_EVFILE_BADARG    if buffer or buflen is NULL
- * @return S_EVFILE_BADHANDLE if bad handle arg
- * @return S_EVFILE_ALLOCFAIL if memory cannot be allocated
  * @return S_EVFILE_UNXPTDEOF if unexpected EOF or end-of-valid-data
- *                            while reading data (perhaps bad block header)
+ *                            while reading data (perhaps bad block header
+ *                            or reading from a too-small buffer)
  * @return EOF                if end-of-file or end-of-valid-data reached
  * @return errno              if file/socket read error
- * @return stream error       if file stream error
+ * @return S_FAILURE          if file reading error
  */
-int evReadAlloc(int handle, uint32_t **buffer, uint32_t *buflen)
+static int evGetNewBufferFileV3(EVFILE *a)
 {
-    EVFILE *a;
-    int status;
+    uint32_t  blkHdrSize;
+    size_t    nBytes=0;
+    int       status = S_SUCCESS;
 
-    
-    if (handle < 1 || handle > handleCount) {
-        return(S_EVFILE_BADHANDLE);
+
+    /* If no data left in the internal buffer ... */
+    if (a->blocksToParse < 1) {
+
+        /* Bytes left to read in file */
+        uint64_t bytesLeftInFile = a->fileSize - a->filePosition;
+        if (bytesLeftInFile < 32L) {
+            return(EOF);
+        }
+
+        /* The block size is a fixed 32kB which is on the small side.
+         * We want to read in 16MB (EV_READ_BYTES_V3) or so at once
+         * for efficiency. */
+        uint32_t fileBytesToRead = EV_READ_BYTES_V3 < bytesLeftInFile ?
+                                   EV_READ_BYTES_V3 : (int) bytesLeftInFile;
+
+        /* Read data */
+        uint32_t bytesRead = 0;
+        char *pBuf = (char *)a->pBuf;
+        while (bytesRead < fileBytesToRead) {
+            nBytes = fread((void *)(pBuf + bytesRead), 1,
+                           (size_t)(fileBytesToRead - bytesRead), a->file);
+            if (nBytes < 1) {
+                if (feof(a->file)) {
+                    return(EOF);
+                }
+                else if (ferror(a->file)) {
+                    /* errno is not set for ferror */
+                    return(S_FAILURE);
+                }
+            }
+            bytesRead += nBytes;
+        }
+
+        /* How many blocks beyond the one we're doing right now? */
+        a->blocksToParse = fileBytesToRead / 32768 - 1;
+
+        /* Keep track of where were are in internal buffer */
+        a->buf = a->pBuf;
+
+        /* Keep track of where were are in reading the file */
+        a->filePosition += bytesRead;
     }
-    
-    /* Don't allow simultaneous calls to evClose(), but do allow reads & writes. */
-    handleReadLock(handle);
-
-    /* Look up file struct (which contains block buffer) from handle */
-    a = handleList[handle-1];
-
-    if (a == NULL) {
-        handleReadUnlock(handle);
-        return(S_EVFILE_BADHANDLE);
+    /* We have more data (whole blocks) in the internal buffer */
+    else {
+        /* Move to next block */
+        a->buf += 8192;
+        a->blocksToParse--;
     }
 
-    status = evReadAllocImpl(a, buffer, buflen);
-    
-    handleReadUnlock(handle);
+    /* Swap header in place if necessary */
+    if (a->byte_swapped) {
+        swap_int32_t(a->buf, EV_HDSIZ, NULL);
+    }
 
-    return status;
-}
-
-
-/** Fortran interface to {@link evRead}. */
-#ifdef AbsoftUNIXFortran
-int evread
-#else
-int evread_
+    /* For ver 1-3 all block headers are same size - 8 words. */
+    blkHdrSize = a->buf[EV_HD_HDSIZ];
+    if (blkHdrSize != 8) {
+#ifdef DEBUG
+        fprintf(stderr,"evGetNewBufferSeqV3: block header != 8 words\n");
 #endif
-(int *handle, uint32_t *buffer, uint32_t *buflen)
-{
-    return(evRead(*handle, buffer, *buflen));
+        /* Although technically OK to have larger block headers, they were always 8 words */
+        return(S_FAILURE);
+    }
+
+    /* Each block is same size. */
+    a->blksiz = a->buf[EV_HD_BLKSIZ];
+    if (a->blksiz != 8192) {
+#ifdef DEBUG
+        fprintf(stderr,"evGetNewBufferSeqV3: block size != 8192 words\n");
+#endif
+        /* Although technically OK to have a different block size, they were always 8192 words */
+        return(S_FAILURE);
+    }
+
+    /* Keep track of the # of blocks read */
+    a->blknum++;
+
+    /* Is our block # consistent with block header's? */
+    if (a->buf[EV_HD_BLKNUM] != a->blknum + a->blkNumDiff) {
+        /* Record the difference so we don't print out a message
+        * every single time if things get out of sync. */
+        a->blkNumDiff = a->buf[EV_HD_BLKNUM] - a->blknum;
+#ifdef DEBUG
+        fprintf(stderr,"evGetNewBuffer: block # read(%d) is different than expected(%d)\n",
+                a->buf[EV_HD_BLKNUM], a->blknum);
+#endif
+    }
+
+    /* Start out pointing to the data right after the block header.
+     * If we're in the middle of reading an event, this will allow
+     * us to continue reading it. If we've looking to read a new
+     * event, this should point to the next one. */
+    a->next = a->buf + blkHdrSize;
+
+    /* Number of valid words left to read in block */
+    a->left = (a->buf)[EV_HD_USED] - blkHdrSize;
+
+    /* If there are no valid data left in block ... */
+    if (a->left < 1) {
+       return(S_EVFILE_UNXPTDEOF);
+    }
+
+    return(status);
 }
 
 
 /**
- * This routine reads from an evio format file/socket/buffer opened with routines
- * {@link evOpen}, {@link evOpenBuffer}, or {@link evOpenSocket} and returns the
- * next event in the buffer arg. Works with all versions of evio. A status is
- * returned.
+ * This routine reads from an evio format file opened with  {@link #evOpen}
+ * and returns the next event in the buffer arg. Works with all versions 1-3
+ * evio format. A status is returned.
  *
  * @param handle evio handle
  * @param buffer pointer to buffer
@@ -3097,55 +3328,17 @@ int evread_
  * @return errno              if file/socket read error
  * @return stream error       if file stream error
  */
-int evRead(int handle, uint32_t *buffer, uint32_t buflen)
+static int evReadFileV3(EVFILE *a, uint32_t *buffer, uint32_t buflen)
 {
-    EVFILE   *a;
     int       status,  swap;
     uint32_t  nleft, ncopy;
-    uint32_t *temp_buffer, *temp_ptr=NULL;
+    uint32_t *temp_buffer=NULL, *temp_ptr=NULL;
 
 
-    if (handle < 1 || handle > handleCount) {
-        return(S_EVFILE_BADHANDLE);
-    }
-    
-    if (buffer == NULL || buflen < 3) {
-        return(S_EVFILE_BADARG);
-    }
-
-    /* Don't allow simultaneous calls to evClose(), but do allow reads & writes. */
-    handleReadLock(handle);
-
-    /* Look up file struct (which contains block buffer) from handle */
-    a = handleList[handle-1];
-
-    /* Check args */
-    if (a == NULL) {
-        handleReadUnlock(handle);
-        return(S_EVFILE_BADHANDLE);
-    }
-
-    /* Need to be reading not writing */
-    if (a->rw != EV_READFILE && a->rw != EV_READPIPE &&
-        a->rw != EV_READBUF  && a->rw != EV_READSOCK) {
-        handleReadUnlock(handle);
-        return(S_EVFILE_BADMODE);
-    }
-    
-    /* Cannot be random access reading */
-    if (a->randomAccess) {
-        handleReadUnlock(handle);
-        return(S_EVFILE_BADMODE);
-    }
-    
-    /* Lock mutex for multithreaded reads/writes/access */
-    mutexLock(a);
-    /* If no more data left to read from current block, get a new block */
+    /* If no more data left to read from current BLOCK, get a new block */
     if (a->left < 1) {
-        status = evGetNewBuffer(a);
+        status = evGetNewBufferFileV3(a);
         if (status != S_SUCCESS) {
-            mutexUnlock(a);
-            handleReadUnlock(handle);
             return(status);
         }
     }
@@ -3168,8 +3361,6 @@ int evRead(int handle, uint32_t *buffer, uint32_t buflen)
         /* Buffer too small, just return error.
          * Previous evio lib tried to swap truncated event!? */
         if (temp_ptr != NULL) free(temp_ptr);
-        mutexUnlock(a);
-        handleReadUnlock(handle);
         return(S_EVFILE_TRUNC);
     }
 
@@ -3178,11 +3369,9 @@ int evRead(int handle, uint32_t *buffer, uint32_t buflen)
 
         /* If no more data left to read from current block, get a new block */
         if (a->left < 1) {
-            status = evGetNewBuffer(a);
+            status = evGetNewBufferFileV3(a);
             if (status != S_SUCCESS) {
                 if (temp_ptr != NULL) free(temp_ptr);
-                mutexUnlock(a);
-                handleReadUnlock(handle);
                 return(status);
             }
         }
@@ -3209,23 +3398,219 @@ int evRead(int handle, uint32_t *buffer, uint32_t buflen)
     /* Store value locally so we can release lock before swapping. */
     swap = a->byte_swapped;
     
-    /* Unlock mutex for multithreaded reads/writes/access */
-    mutexUnlock(a);
-    handleReadUnlock(handle);
-
     /* Swap event if necessary */
     if (swap) {
-        evioswap((uint32_t*)temp_ptr, 1, (uint32_t*)buffer);
+        evioswap(temp_ptr, 1, buffer);
         free(temp_ptr);
     }
-    
+
     return(S_SUCCESS);
 }
 
 
 /**
+ * This routine reads from an evio format file/socket/buffer opened with routines
+ * {@link #evOpen}, {@link #evOpenBuffer}, or {@link #evOpenSocket} and returns the
+ * next event in the buffer arg. Works with all versions of evio. A status is
+ * returned.
+ *
+ * @param handle evio handle
+ * @param buffer pointer to buffer
+ * @param buflen length of buffer in 32 bit words
+ *
+ * @return S_SUCCESS          if successful
+ * @return S_EVFILE_BADMODE   if opened for writing or random-access reading
+ * @return S_EVFILE_TRUNC     if buffer provided by caller is too small for event read
+ * @return S_EVFILE_BADARG    if buffer is NULL or buflen < 3
+ * @return S_EVFILE_BADHANDLE if bad handle arg
+ * @return S_EVFILE_ALLOCFAIL if memory cannot be allocated
+ * @return S_EVFILE_UNXPTDEOF if unexpected EOF or end-of-valid-data
+ *                            while reading data (perhaps bad block header)
+ * @return EOF                if end-of-file or end-of-valid-data reached
+ * @return errno              if file/socket read error
+ * @return stream error       if file stream error
+ */
+int evRead(int handle, uint32_t *buffer, uint32_t buflen)
+{
+    EVFILE   *a;
+    int       status,  swap;
+    uint32_t  nleft, ncopy;
+    uint32_t *temp_buffer=NULL, *temp_ptr=NULL;
+
+
+    if (handle < 1 || handle > handleCount) {
+        return(S_EVFILE_BADHANDLE);
+    }
+
+    if (buffer == NULL || buflen < 3) {
+        return(S_EVFILE_BADARG);
+    }
+
+    /* For thread-safe function calls */
+    handleLock(handle);
+
+    /* Look up file struct (which contains block buffer) from handle */
+    a = handleList[handle-1];
+
+    /* Check args */
+    if (a == NULL) {
+        handleUnlock(handle);
+        return(S_EVFILE_BADHANDLE);
+    }
+
+    /* Need to be reading not writing */
+    if (a->rw != EV_READFILE && a->rw != EV_READPIPE &&
+        a->rw != EV_READBUF  && a->rw != EV_READSOCK) {
+        handleUnlock(handle);
+        return(S_EVFILE_BADMODE);
+    }
+
+    /* Cannot be random access reading */
+    if (a->randomAccess) {
+        handleUnlock(handle);
+        return(S_EVFILE_BADMODE);
+    }
+
+    if (a->rw == EV_READFILE && a->version < 4) {
+        int err = evReadFileV3(a, buffer, buflen);
+        handleUnlock(handle);
+        return (err);
+    }
+
+    /* If no more data left to read from current block, get a new block */
+    if (a->left < 1) {
+        status = evGetNewBuffer(a);
+        if (status != S_SUCCESS) {
+            handleUnlock(handle);
+            return(status);
+        }
+    }
+
+    /* Find number of words to read in next event (including header) */
+    if (a->byte_swapped) {
+        /* Create temp buffer for swapping */
+        temp_ptr = temp_buffer = (uint32_t *) malloc(buflen*sizeof(uint32_t));
+        if (temp_ptr == NULL) return(S_EVFILE_ALLOCFAIL);
+        /* Value at pointer to next event (bank) header = length of bank - 1 */
+        nleft = EVIO_SWAP32(*(a->next)) + 1;
+    }
+    else {
+        /* Length of next bank, including header, in 32 bit words */
+        nleft = *(a->next) + 1;
+    }
+
+    /* Is there NOT enough room in buffer to store whole event? */
+    if (nleft > buflen) {
+        /* Buffer too small, just return error.
+         * Previous evio lib tried to swap truncated event!? */
+        if (temp_ptr != NULL) free(temp_ptr);
+        handleUnlock(handle);
+        return(S_EVFILE_TRUNC);
+    }
+
+    /* While there is more event data left to read ... */
+    while (nleft > 0) {
+
+        /* If no more data left to read from current block, get a new block */
+        if (a->left < 1) {
+            status = evGetNewBuffer(a);
+            if (status != S_SUCCESS) {
+                if (temp_ptr != NULL) free(temp_ptr);
+                handleUnlock(handle);
+                return(status);
+            }
+        }
+
+        /* If # words left to read in event <= # words left in block,
+         * copy # words left to read in event to buffer, else
+         * copy # left in block to buffer.*/
+        ncopy = (nleft <= a->left) ? nleft : a->left;
+
+        if (a->byte_swapped) {
+            memcpy(temp_buffer, a->next, ncopy*4);
+            temp_buffer += ncopy;
+        }
+        else{
+            memcpy(buffer, a->next, ncopy*4);
+            buffer += ncopy;
+        }
+
+        nleft   -= ncopy;
+        a->next += ncopy;
+        a->left -= ncopy;
+    }
+
+    /* Store value locally so we can release lock before swapping. */
+    swap = a->byte_swapped;
+
+    /* Unlock mutex for multithreaded reads/writes/access */
+    handleUnlock(handle);
+
+    /* Swap event if necessary */
+    if (swap) {
+        evioswap(temp_ptr, 1, buffer);
+        free(temp_ptr);
+    }
+
+    return(S_SUCCESS);
+}
+
+
+/**
+ * This routine reads an evio bank from an evio format file/socket/buffer
+ * opened with routines {@link #evOpen}, {@link #evOpenBuffer}, or
+ * {@link #evOpenSocket}, allocates a buffer and fills it with the bank.
+ * Works with all versions of evio. A status is returned.
+ *
+ * @param handle evio handle
+ * @param buffer pointer to pointer to buffer gets filled with
+ *               pointer to allocated buffer (caller must free)
+ * @param buflen pointer to int gets filled with length of buffer in 32 bit words
+ *               including the full (8 byte) bank header
+ *
+ * @return S_SUCCESS          if successful
+ * @return S_EVFILE_BADMODE   if opened for writing or random-access reading
+ * @return S_EVFILE_BADARG    if buffer or buflen is NULL
+ * @return S_EVFILE_BADHANDLE if bad handle arg
+ * @return S_EVFILE_ALLOCFAIL if memory cannot be allocated
+ * @return S_EVFILE_UNXPTDEOF if unexpected EOF or end-of-valid-data
+ *                            while reading data (perhaps bad block header)
+ * @return EOF                if end-of-file or end-of-valid-data reached
+ * @return errno              if file/socket read error
+ * @return stream error       if file stream error
+ */
+int evReadAlloc(int handle, uint32_t **buffer, uint32_t *buflen)
+{
+    EVFILE *a;
+    int status;
+
+
+    if (handle < 1 || handle > handleCount) {
+        return(S_EVFILE_BADHANDLE);
+    }
+
+    /* For thread-safe function calls */
+    handleLock(handle);
+
+    /* Look up file struct (which contains block buffer) from handle */
+    a = handleList[handle-1];
+
+    if (a == NULL) {
+        handleUnlock(handle);
+        return(S_EVFILE_BADHANDLE);
+    }
+
+    status = evReadAllocImpl(a, buffer, buflen);
+
+    handleUnlock(handle);
+
+    return status;
+}
+
+
+/**
  * This routine reads from an evio format file/buffer/socket opened with routines
- * {@link evOpen}, {@link evOpenBuffer}, or {@link evOpenSocket} and returns a
+ * {@link #evOpen}, {@link #evOpenBuffer}, or {@link #evOpenSocket} and returns a
  * pointer to the next event residing in an internal buffer.
  * If the data needs to be swapped, it is swapped in place. Any other
  * calls to read routines may cause the data to be overwritten.
@@ -3235,7 +3620,7 @@ int evRead(int handle, uint32_t *buffer, uint32_t buflen)
  * @param handle evio handle
  * @param buffer pointer to pointer to buffer gets filled with pointer to location in
  *               internal buffer which is guaranteed to be valid only until the next
- *               {@link evRead}, {@link evReadNoAlloc}, or {@link evReadNoCopy} call.
+ *               {@link #evRead}, {@link #evReadNoAlloc}, or {@link #evReadNoCopy} call.
  * @param buflen pointer to int gets filled with length of buffer in 32 bit words
  *               including the full (8 byte) bank header
  *
@@ -3266,47 +3651,43 @@ int evReadNoCopy(int handle, const uint32_t **buffer, uint32_t *buflen)
         return(S_EVFILE_BADARG);
     }
 
-    /* Don't allow simultaneous calls to evClose(), but do allow reads & writes. */
-    handleReadLock(handle);
+    /* For thread-safe function calls */
+    handleLock(handle);
 
     /* Look up file struct (which contains block buffer) from handle */
     a = handleList[handle-1];
 
     /* Check args */
     if (a == NULL) {
-        handleReadUnlock(handle);
+        handleUnlock(handle);
         return(S_EVFILE_BADHANDLE);
     }
 
     /* Returning a pointer into a block only works in evio version 4 and
      * up since in earlier versions events may be split between blocks. */
     if (a->version < 4) {
-        handleReadUnlock(handle);
+        handleUnlock(handle);
         return(S_EVFILE_BADFILE);
     }
 
     /* Need to be reading and not writing */
     if (a->rw != EV_READFILE && a->rw != EV_READPIPE &&
         a->rw != EV_READBUF  && a->rw != EV_READSOCK) {
-        handleReadUnlock(handle);
+        handleUnlock(handle);
         return(S_EVFILE_BADMODE);
     }
     
     /* Cannot be random access reading */
     if (a->randomAccess) {
-        handleReadUnlock(handle);
+        handleUnlock(handle);
         return(S_EVFILE_BADMODE);
     }
     
-    /* Lock mutex for multithreaded reads/writes/access */
-    mutexLock(a);
-
     /* If no more data left to read from current block, get a new block */
     if (a->left < 1) {
         status = evGetNewBuffer(a);
         if (status != S_SUCCESS) {
-            mutexUnlock(a);
-            handleReadUnlock(handle);
+            handleUnlock(handle);
             return(status);
         }
     }
@@ -3331,8 +3712,7 @@ int evReadNoCopy(int handle, const uint32_t **buffer, uint32_t *buflen)
     a->next += nleft;
     a->left -= nleft;
     
-    mutexUnlock(a);
-    handleReadUnlock(handle);
+    handleUnlock(handle);
 
     return(S_SUCCESS);
 }
@@ -3340,9 +3720,13 @@ int evReadNoCopy(int handle, const uint32_t **buffer, uint32_t *buflen)
 
 /**
  * This routine does a random access read from an evio format file/buffer opened
- * with routines {@link evOpen} or {@link evOpenBuffer}. It returns a
+ * with routines {@link #evOpen} or {@link #evOpenBuffer}. It returns a
  * pointer to the desired event residing in either a
- * memory mapped file or buffer when opened in random access mode.
+ * memory mapped file or buffer when opened in random access mode.<p>
+ *
+ * If reading a file from a remote machine, it is not wise to use
+ * the "ra" flag in evOpen. This memory maps the file which is not
+ * ideal over the network.<p>
  * 
  * If the data needs to be swapped, it is swapped in place.
  * No writing to the returned pointer is allowed.
@@ -3375,35 +3759,35 @@ int evReadRandom(int handle, const uint32_t **pEvent, uint32_t *buflen, uint32_t
     if (handle < 1 || handle > handleCount) {
         return(S_EVFILE_BADHANDLE);
     }
-    
-    /* Don't allow simultaneous calls to evClose(), but do allow reads & writes. */
-    handleReadLock(handle);
+
+    /* For thread-safe function calls */
+    handleLock(handle);
 
     /* Look up file struct (which contains block buffer) from handle */
     a = handleList[handle-1];
 
     /* Check args */
     if (a == NULL) {
-        handleReadUnlock(handle);
+        handleUnlock(handle);
         return(S_EVFILE_BADHANDLE);
     }
 
     /* Returning a pointer into a block only works in evio version 4 and
     * up since in earlier versions events may be split between blocks. */
     if (a->version < 4) {
-        handleReadUnlock(handle);
+        handleUnlock(handle);
         return(S_EVFILE_BADFILE);
     }
 
     /* Need to be *** random access *** reading (not from socket or pipe) and not writing */
     if ((a->rw != EV_READFILE && a->rw != EV_READBUF) || !a->randomAccess) {
-        handleReadUnlock(handle);
+        handleUnlock(handle);
         return(S_EVFILE_BADMODE);
     }
 
     /* event not in file/buf */
     if (eventNumber > a->eventCount || a->pTable == NULL) {
-        handleReadUnlock(handle);
+        handleUnlock(handle);
         return(S_FAILURE);
     }
 
@@ -3411,12 +3795,9 @@ int evReadRandom(int handle, const uint32_t **pEvent, uint32_t *buflen, uint32_t
 
     /* event not in file/buf */
     if (pev == NULL) {
-        handleReadUnlock(handle);
+        handleUnlock(handle);
         return(S_FAILURE);
     }
-
-    /* Lock mutex for multithreaded swap */
-    mutexLock(a);
 
     /* Find number of words to read in next event (including header) */
     /* and swap data in buf/mem-map if necessary */
@@ -3432,15 +3813,16 @@ int evReadRandom(int handle, const uint32_t **pEvent, uint32_t *buflen, uint32_t
         *buflen = *pev + 1;
     }
     
-    mutexUnlock(a);
-   
     /* return pointer to event in memory map / buffer */
     *pEvent = pev;
-    
-    handleReadUnlock(handle);
+
+    handleUnlock(handle);
 
     return(S_SUCCESS);
 }
+
+
+/** @} */
 
 
 /**
@@ -3494,7 +3876,7 @@ static int evGetNewBuffer(EVFILE *a)
         }
     }
     else if (a->rw == EV_READSOCK) {
-        nBytes = tcpRead(a->sockFd, a->buf, bytesToRead);
+        nBytes = (size_t) tcpRead(a->sockFd, a->buf, (int)bytesToRead);
     }
     else if (a->rw == EV_READPIPE) {
         nBytes = fread(a->buf, 1, bytesToRead, a->file);
@@ -3515,7 +3897,7 @@ static int evGetNewBuffer(EVFILE *a)
 
     /* Swap header in place if necessary */
     if (a->byte_swapped) {
-        swap_int32_t((uint32_t *)a->buf, EV_HDSIZ, NULL);
+        swap_int32_t(a->buf, EV_HDSIZ, NULL);
     }
     
     /* It is possible that the block header size is > EV_HDSIZ.
@@ -3535,7 +3917,7 @@ if (debug) printf("HEADER IS TOO BIG, reading an extra %lu bytes\n", bytesToRead
             if (ferror(a->file)) return(ferror(a->file));
         }
         else if (a->rw == EV_READSOCK) {
-            nBytes = tcpRead(a->sockFd, a->buf + EV_HDSIZ, bytesToRead);
+            nBytes = (size_t) tcpRead(a->sockFd, a->buf + EV_HDSIZ, (int) bytesToRead);
         }
         else if (a->rw == EV_READPIPE) {
             nBytes = fread(a->buf + EV_HDSIZ, 1, bytesToRead, a->file);
@@ -3552,7 +3934,7 @@ if (debug) printf("HEADER IS TOO BIG, reading an extra %lu bytes\n", bytesToRead
                 
         /* Swap in place if necessary */
         if (a->byte_swapped) {
-            swap_int32_t(a->buf + EV_HDSIZ, bytesToRead/4, NULL);
+            swap_int32_t(a->buf + EV_HDSIZ, (unsigned int) bytesToRead/4, NULL);
         } 
     }
     
@@ -3587,7 +3969,7 @@ if (debug) printf("HEADER IS TOO BIG, reading an extra %lu bytes\n", bytesToRead
         if (ferror(a->file)) {return(ferror(a->file));}
     }
     else if (a->rw == EV_READSOCK) {
-        nBytes = tcpRead(a->sockFd, (a->buf + blkHdrSize), bytesToRead);
+        nBytes = (size_t) tcpRead(a->sockFd, (a->buf + blkHdrSize), (int) bytesToRead);
     }
     else if (a->rw == EV_READSOCK) {
         nBytes = fread((a->buf + blkHdrSize), 1, bytesToRead, a->file);
@@ -3683,117 +4065,59 @@ static int generateSixthWord(int version, int hasDictionary, int isEnd, int even
  * @param blockNumber   number of block
  * @param hasDictionary does this block have a dictionary?
  * @param isLast        is this the last block?
- * @param currentHeader should this header be considered the current header?
- * @param absoluteMode  should this header be written so the internal
- *                      buffer's position does <b></b>not</b> change?
- * 
+ *
  * @return S_SUCCESS    if successful
  * @return S_FAILURE    if not enough space in buffer for header
  */
-static int writeNewHeader(EVFILE *a, uint32_t wordSize,
+static int writeNewHeader(EVFILE *a,
                           uint32_t eventCount, uint32_t blockNumber,
-                          int hasDictionary,   int isLast,
-                          int isCurrentHeader, int absoluteMode)
+                          int hasDictionary, int isLast)
 {
     uint32_t *pos, debug=0;
     
     
     /* If no room left for a header to be written in buffer ... */
     if ((a->bufSize - a->bytesToBuf/4) < 8) {
-if (debug) printf("writeNewHeader(): no room in buffer, return, buf size = %u, bytes to buf = %u\n",
+if (debug) printf("writeNewHeader: no room in buffer, return, buf size = %u, bytes to buf = %u\n",
                a->bufSize, a->bytesToBuf/4);
         return (S_FAILURE);
     }
 
     /* Record where beginning of header is so we can
      * go back and update block size and event count. */
-    if (isCurrentHeader) {
-        a->currentHeader = a->next;
-    }
+    a->currentHeader = a->next;
 
-/*if (debug) printf("writeNewHeader(): words = %d, block# = %d, ev Cnt = %d, 6th wd = 0x%x\n",
+/*if (debug) printf("writeNewHeader: words = %d, block# = %d, ev Cnt = %d, 6th wd = 0x%x\n",
     wordSize, blockNumber, eventCount, generateSixthWord(4, hasDictionary, isLast, 0)); */
 
     /* Write header words, some of which will be
      * overwritten later when the values are determined. */
     pos    = a->next;
-    pos[0] = wordSize;     /* actual size in 32-bit words (Ints) */
+    pos[0] = EV_HDSIZ;     /* actual size in 32-bit words (Ints) */
     pos[1] = blockNumber;  /* incremental count of blocks */
     pos[2] = 8;            /* header size always 8 */
     pos[3] = eventCount;   /* number of events in block */
     pos[4] = 0;            /* unused / sourceId for coda event building */
                            /* version = 4, no event type info */
-    pos[5] = generateSixthWord(4, hasDictionary, isLast, 0);
+    pos[5] = (uint32_t) generateSixthWord(4, hasDictionary, isLast, 0);
     pos[6] = 0;            /* unused */
     pos[7] = EV_MAGIC;     /* MAGIC_NUMBER */
-        
-    if (!absoluteMode) {
-        a->next   += 8;
-        a->left   -= 8;
-        a->blksiz  = 8;
-        a->blkEvCount = 0;
-    }
-    
+
+    a->next   += 8;
+    a->left   -= 8;
+    a->blksiz  = 8;
+    a->blkEvCount = 0;
     a->bytesToBuf += 4*EV_HDSIZ;
 
+    if (isLast) {
+if (debug) printf("writeNewHeader: last empty header added");
+        /* Last item in internal buffer is last empty block header */
+        a->lastEmptyBlockHeaderExists = 1;
+    }
+
+
+    if (debug) printf("writeNewHeader: add hdr to bytesToBuf = %u\n", a->bytesToBuf);
     return (S_SUCCESS);
-}
-
-
-/**
- * This routine writes an empty, last block (just the header).
- * This ensures that if the data taking software crashes in the mean time,
- * we still have a file or buffer in the proper format.
- * Make sure that the "last block" bit is set. If we're not closing,
- * the block header simply gets over written in the next write.
- * The position of the buffer or file channel is not changed in preparation
- * for writing over the last block header.
- *
- * @param a             pointer to file structure
- * @param blockNumber   block number to use in header
- * @return S_SUCCESS    if successful
- * @return S_FAILURE    if not enough space in buffer for header
- */
-static int writeEmptyLastBlockHeader(EVFILE *a, int blockNumber)
-{
-    return writeNewHeader(a, 8, 0, blockNumber, 0, 1, 0, 1);
-}
-
-
-/** Fortran interface to {@link evWrite}. */
-#ifdef AbsoftUNIXFortran
-int evwrite
-#else
-int evwrite_
-#endif
-(int *handle, const uint32_t *buffer)
-{
-    return(evWrite(*handle, buffer));
-}
-
-
-/**
- * This routine writes an evio event to an internal buffer containing evio data.
- * If that internal buffer is full, it is flushed to the final destination
- * file/socket/buffer/pipe opened with routines {@link evOpen}, {@link evOpenBuffer},
- * or {@link evOpenSocket}.
- * It writes data in evio version 4 format and returns a status.
- *
- * @param handle evio handle
- * @param buffer pointer to buffer containing event to write
- *
- * @return S_SUCCESS          if successful
- * @return S_EVFILE_BADMODE   if opened for reading or appending to opposite endian file/buffer.
- * @return S_EVFILE_TRUNC     if not enough room writing to a user-supplied buffer
- * @return S_EVFILE_BADARG    if buffer is NULL
- * @return S_EVFILE_BADHANDLE if bad handle arg
- * @return S_EVFILE_ALLOCFAIL if cannot allocate memory
- * @return errno              if file/socket write error
- * @return stream error       if file stream error
- */
-int evWrite(int handle, const uint32_t *buffer)
-{
-    return evWriteImpl(handle, buffer, 1, 0);
 }
 
 
@@ -3869,6 +4193,7 @@ if (debug) printf("  writeEventToBuffer: before write, bytesToBuf = %u\n",
     /* Update the current block header's size, event count, ... */
     a->blksiz     +=   wordsToWrite;
     a->bytesToBuf += 4*wordsToWrite;
+if (debug) printf("  writeEventToBuffer: add %u bytes, bytesToBuf = %u\n", (4*wordsToWrite), a->bytesToBuf);
     a->next       +=   wordsToWrite;
     a->left       -=   wordsToWrite;
     a->blkEvCount++;
@@ -3883,14 +4208,16 @@ if (debug) printf("  writeEventToBuffer: before write, bytesToBuf = %u\n",
         /* Do not include dictionary in header event count.
          * Dictionaries are written in their own block. */
         a->currentHeader[EV_HD_COUNT] = 0;
+if (debug) printf("  writeEventToBuffer: writing dict, set block cnt = 0, a->blkEvCount = %u\n", a->blkEvCount);
     }
     else {
         a->eventCount++;
         a->currentHeader[EV_HD_COUNT] = a->blkEvCount;
         /* If we wrote a dictionary and it's the first block, don't count dictionary ... */
         if (a->wroteDictionary && a->blknum == 2 && (a->blkEvCount - 1 > 0)) {
-if (debug) printf("  writeEventToBuffer: substract ev cnt since in dictionary's block\n");
             a->currentHeader[EV_HD_COUNT]--;
+if (debug) printf("  writeEventToBuffer: substract ev cnt since in dictionary's block, cur header block cnt = %u, a->blkEvCount = %u\n",
+                  a->currentHeader[EV_HD_COUNT],  a->blkEvCount);
         }
         
         /* Signifies that we wrote an event. Used in evIoctl
@@ -3899,48 +4226,52 @@ if (debug) printf("  writeEventToBuffer: substract ev cnt since in dictionary's 
     }
 
     /* If we're writing over the last empty block header for the
-     * first time (first write after opening file or flush), increment block #,
-     * clear last block bit */
+     * first time (first write after opening file or flush), clear last block bit */
     if (isLastBlock(a->currentHeader)) {
         /* Always end up here if writing a dictionary */
 if (debug) printf("  writeEventToBuffer: IS LAST BLOCK\n");
         clearLastBlockBit(a->currentHeader);
-        /* Here is where blknum goes from 1 to 2 */
-        a->blknum++;
+        ///* Here is where blknum goes from 1 to 2 */
+        //a->blknum++;
     }
    
 if (debug) printf("  writeEventToBuffer: after write,  bytesToBuf = %u, blksiz = %u, blkEvCount = %u\n",
                       a->bytesToBuf, a->blksiz, a->blkEvCount);
-    
-    /* (Re)Write the last, empty block header so it can be
-     * flushed at any time and still create a valid file. */
-    writeEmptyLastBlockHeader(a, a->blknum);
+
+    if (debug) {
+        printf("writeEventToBuffer: after last header written, Events written to:\n");
+        printf("                    cnt total (no dict) = %u\n", a->eventCount);
+        printf("                    file cnt total (dict) = %u\n", a->eventsToFile);
+        printf("                    internal buffer cnt (dict) = %u\n", a->eventsToBuf);
+        printf("                    block cnt (dict) = %u\n", a->blkEvCount);
+        printf("                    bytes-to-buf = %u\n", a->bytesToBuf);
+        printf("                    block # = %u\n", a->blknum);
+    }
 }
 
 
 /**
  * This routine writes a dictionary to the internal buffer.
- * It's a simpified version of {@link #evWriteImpl()}.
+ * It's a simplified version of {@link #evWriteImpl()}.
  *
  * @param handle   evio handle
  * @param buffer   pointer to buffer containing event to write
  *
  * @return S_SUCCESS          if successful
- * @return S_EVFILE_TRUNC     if not enough room writing to a user-given buffer in {@link evOpen}
+ * @return S_EVFILE_TRUNC     if not enough room writing to a user-given buffer in {@link #evOpen}
  * @return S_EVFILE_ALLOCFAIL if cannot allocate memory
  */
-static int evWriteDictImpl(EVFILE *a, const uint32_t *buffer)
+static int evWriteDictImpl(EVFILE *a)
 {
     uint32_t nToWrite, size;
     int status, debug=0;
 
-
     /* Number of words left to write = full event size + bank header */
-    nToWrite = buffer[0] + 1;
-    
+    nToWrite =  a->dictBuf[0] + 1;
+
 if (debug) printf("evWriteDict: bufSize = %u <? bytesToWrite = (dict) %u + (2 hdr) 64 = %u \n",
     (4*a->bufSize), (4*nToWrite), (4*nToWrite + 64));
-    
+
     /* Is this event (by itself) too big for the current internal buffer?
      * Internal buffer needs room for first block header, event, and ending empty block. */
     if (4*a->bufSize < 4*(nToWrite + 2*EV_HDSIZ)) {
@@ -3961,17 +4292,19 @@ if (debug) printf("evWriteDict: buf size (bytes) = %d, needed for event + header
         if (status != S_SUCCESS) {
             return status;
         }
-        
-        /* Init buffer with last empty block -
-         * just like when initially calling evOpen() */
-        resetBuffer(a);
+
+        /* Init buffer just like when initially calling evOpen() */
+        resetBuffer(a, 1);
     }
 
     /********************************************************/
     /* Now we have enough room for the event in the buffer. */
     /* So write the event to the internal buffer.           */
     /********************************************************/
-    writeEventToBuffer(a, buffer, nToWrite, 1);
+    writeEventToBuffer(a, a->dictBuf, nToWrite, 1);
+
+    /* dictionary defined and written into common (first) block */
+    a->commonBlkCount++;
 
 if (debug) {
         printf("evWriteDictImpl: after last header written, Events written to:\n");
@@ -3987,45 +4320,124 @@ if (debug) {
 }
 
 
+/**
+ * This routine writes a dictionary and the first event to the beginning of the internal buffer.
+ * Before this routine is called in {@link #evWrite()} the buffer is already increased in size,
+ * if necessary, to accommodate the dictionary, first event, and 3 block headers.
+ *
+ * @param handle   evio handle
+ * @param buffer   pointer to buffer containing event to write
+ *
+ * @return S_SUCCESS          if successful
+ * @return S_EVFILE_TRUNC     if not enough room writing to a user-given buffer in {@link #evOpen}
+ * @return S_EVFILE_ALLOCFAIL if cannot allocate memory
+ */
+static int evWriteCommonBlock(EVFILE *a)
+{
+    int status, debug=0;
+
+    /* Words common block */
+    uint32_t numWordsToWrite;
+
+    // No common events to write
+    if (a->dictBuf == NULL && a->firstEventBuf == NULL) return(S_SUCCESS);
+
+    /* Number of words to write dict & first event */
+    numWordsToWrite = 2*EV_HDSIZ + a->dictLength/4 + a->firstEventLength/4;
+
+    if (debug) printf("evWriteCommonBlock: bufSize = %u <? bytesToWrite = (dict) %u + (2 hdr) 64 = %u \n",
+                      a->bufSize, numWordsToWrite, (4*numWordsToWrite));
+
+    /* Make sure there is enough space in buffer for dict + first event + 2 block headers */
+    if (a->bufSize < numWordsToWrite) {
+
+        /* Cannot increase size of user-given buffer */
+        if (a->rw == EV_WRITEBUF) {
+            return(S_EVFILE_TRUNC);
+        }
+
+        if (debug) printf("evWriteCommonBlock: buf size (bytes) = %d, needed for event + headers = %d\n",
+                          (4*a->bufSize), (4*numWordsToWrite));
+
+        /* Increase buffer size and DON"T copy first header from old to new */
+        status = expandBuffer(a, 4*numWordsToWrite);
+        if (status != S_SUCCESS) {
+            return status;
+        }
+
+        /* Init buffer just like when initially calling evOpen() */
+        resetBuffer(a, 1);
+    }
+
+    if (a->dictBuf != NULL) {
+        /* Number of words to write = data + full bank header = a->dictBuf[0] + 1 */
+        writeEventToBuffer(a, a->dictBuf, a->dictLength/4, 1);
+    }
+
+    if (a->firstEventBuf != NULL) {
+        /* Number of words to write = data + full bank header = a->firstEventBuf[0] + 1 */
+        writeEventToBuffer(a, a->firstEventBuf, a->firstEventLength/4, 0);
+    }
+
+    /* As soon as we write an event, we need another last empty block */
+    a->lastEmptyBlockHeaderExists = 0;
+
+    if (debug) {
+        printf("evWriteCommonBlock: after last header written, Events written to:\n");
+        printf("                    cnt total (no dict) = %u\n", a->eventCount);
+        printf("                    file cnt total = %u\n", a->eventsToFile);
+        printf("                    internal buffer cnt = %u\n", a->eventsToBuf);
+        printf("                    block cnt = %u\n", a->blkEvCount);
+        printf("                    bytes-to-buf = %u\n", a->bytesToBuf);
+        printf("                    block # = %u\n", a->blknum);
+    }
+
+    return(S_SUCCESS);
+}
+
 
 /**
  * This routine initializes the internal buffer
  * as if evOpen was just called and resets some
  * evio handle structure variables.
  *
- * @param handle   evio handle
- * @param buffer   pointer to buffer containing event to write
+ * @param a                pointer to data structure
+ * @param beforeDictionary is this to reset buffer as it was before the
+ *                         writing of the dictionary?
  */
-static void resetBuffer(EVFILE *a) {
+void resetBuffer(EVFILE *a, int beforeDictionary) {
 
-    if (0) printf("    resetBuffer()\n");
-    
-    /* Initialize block header for next write -
-     * just like when initially calling evOpen() */
-    initLastBlockHeader(a->buf, a->blknum);
-    a->currentHeader = a->buf;
+    /* Go back to the beginning of the buffer */
+    a->next = a->buf;
 
-    /* Pointer to where next to write. In this case, the start
-     * of first event header will be right after header. */
-    a->next = a->buf + EV_HDSIZ;
+    /* Reset buffer values */
+    a->bytesToBuf = 0;
+    a->eventsToBuf = 0;
+
+    /* By default, last item in internal buffer is NOT last empty block header */
+    a->lastEmptyBlockHeaderExists = 0;
+
     /* Space in number of words, not in header, left for writing in block buffer */
     a->left = a->bufSize - EV_HDSIZ;
-    /* Total written size (words) = block header size so far */
-    a->blksiz = EV_HDSIZ;
-    /* No events in block yet */
-    a->blkEvCount = 0;
-    
-    /* Reset buffer values for reuse */
-    a->bytesToBuf  = 4*EV_HDSIZ; /* First block header */
-    a->eventsToBuf = 0;
+
+    /* Initialize block header as empty block and start writing after it */
+    if (beforeDictionary) {
+/*printf("      resetBuffer: as in evOpen\n");*/
+        a->blknum = 1;
+        writeNewHeader(a, 0, a->blknum++, ((a->dictionary != NULL) ? 1 : 0), 0);
+    }
+    else {
+/*printf("      resetBuffer: NOTTTT as in evOpen\n");*/
+        writeNewHeader(a, 0, a->blknum++, 0, 0);
+    }
 }
 
 
 /**
  * This routine writes an evio event to an internal buffer containing evio data.
  * If the internal buffer is full, it is flushed to the final destination
- * file/socket/buffer/pipe opened with routines {@link evOpen}, {@link evOpenBuffer},
- * or {@link evOpenSocket}. The file will possibly be split into multiple files if
+ * file/socket/buffer/pipe opened with routines {@link #evOpen}, {@link #evOpenBuffer},
+ * or {@link #evOpenSocket}. The file will possibly be split into multiple files if
  * a split size was given by calling evIoctl. Note that the split file size may be
  * <b>bigger</b> than the given limit by 32 bytes using the algorithm below.
  * It writes data in evio version 4 format and returns a status.
@@ -4033,7 +4445,6 @@ static void resetBuffer(EVFILE *a) {
  * @param handle   evio handle
  * @param buffer   pointer to buffer containing event to write
  * @param useMutex if != 0, use mutex locking, else no locking
- * @param isDictionary if != 0, bank being written is the dictionary
  *
  * @return S_SUCCESS          if successful
  * @return S_FAILURE          if internal programming error writing block header, or
@@ -4044,17 +4455,13 @@ static void resetBuffer(EVFILE *a) {
  * @return S_EVFILE_BADHANDLE if bad handle arg
  * @return S_EVFILE_ALLOCFAIL if cannot allocate memory
  */
-static int evWriteImpl(int handle, const uint32_t *buffer, int useMutex, int isDictionary)
+static int evWriteImpl(int handle, const uint32_t *buffer, int useMutex)
 {
     EVFILE   *a;
-    uint32_t nToWrite, size;
+    uint32_t wordsToWrite, bytesToWrite, size=0;
     int status, debug=0, headerBytes = 4*EV_HDSIZ, splittingFile=0;
-    int doFlush = 0;
-    int roomInBuffer = 1;
-    int needBiggerBuffer = 0;
-    int writeNewBlockHeader = 1;
-    int fileActuallySplit = 0;
-
+    int doFlush = 0, roomInBuffer = 1, needBiggerBuffer = 0;
+    int writeNewBlockHeader = 1, fileActuallySplit = 0;
     
     if (handle < 1 || handle > handleCount) {
         return(S_EVFILE_BADHANDLE);
@@ -4064,117 +4471,87 @@ static int evWriteImpl(int handle, const uint32_t *buffer, int useMutex, int isD
         return(S_EVFILE_BADARG);
     }
 
-    /* Don't allow simultaneous calls to evClose(), but do allow reads & writes. */
-    if (useMutex) handleReadLock(handle);
+    /* For thread-safe function calls */
+    if (useMutex) handleLock(handle);
 
     /* Look up file struct (which contains block buffer) from handle */
     a = handleList[handle-1];
 
     /* Check args */
     if (a == NULL) {
-        if (useMutex) handleReadUnlock(handle);
+        if (useMutex) handleUnlock(handle);
         return(S_EVFILE_BADHANDLE);
     }
 
     /* If appending and existing file/buffer is opposite endian, return error */
     if (a->append && a->byte_swapped) {
-        if (useMutex) handleReadUnlock(handle);
+        if (useMutex) handleUnlock(handle);
         return(S_EVFILE_BADMODE);
     }
-    
-    /* Special case when writing directly to buffer (no block buffer) */
-    /*
-    if (a->rw == EV_WRITEBUF) {
-        status = evWriteBuffer(a, buffer, useMutex);
-        if (useMutex) handleReadUnlock(handle);
-        return status;
-    }
-    */
 
     /* Need to be open for writing not reading */
     if (a->rw != EV_WRITEFILE && a->rw != EV_WRITEBUF &&
         a->rw != EV_WRITESOCK && a->rw != EV_WRITEPIPE) {
-        if (useMutex) handleReadUnlock(handle);
+        if (useMutex) handleUnlock(handle);
         return(S_EVFILE_BADMODE);
     }
 
-    /* Number of words left to write = full event size + bank header */
-    nToWrite = buffer[0] + 1;
+    /* Number of words/bytes left to write = full event size + bank header */
+    wordsToWrite = buffer[0] + 1;
+    bytesToWrite = 4 * wordsToWrite;
 
-    /* Lock mutex for multithreaded reads/writes/access */
-    if (useMutex) mutexLock(a);
-
-    /* Use other function to write dictionary */
-    if (isDictionary) {
-        status = evWriteDictImpl(a, a->dictBuf);
-        if (useMutex) {
-            mutexUnlock(a);
-            handleReadUnlock(handle);
-        }
-        return (status);
-    }
-    
     if (debug && a->splitting) {
-printf("evWrite: splitting, bytesToFile = %llu (bytes), event bytes = %u, bytesToBuf = %u, split = %llu\n",
-               a->bytesToFile, (4*nToWrite), a->bytesToBuf, a->split );
+printf("evWrite: splitting, bytesToFile = %llu, event bytes = %u, bytesToBuf = %u, split = %llu\n",
+               a->bytesToFile, bytesToWrite, a->bytesToBuf, a->split);
+printf("evWrite: blockNum = %u, (blkNum == 2) = %d, eventsToBuf (%u)  <=? common blk cnt (%u)\n",
+       a->blknum, (a->blknum == 2),  a->eventsToBuf,  a->commonBlkCount);
     }
-    
-    /* If we have enough room in the current block and have not exceeded
-     * the number of allowed events, or this is the first event,
-     * write it in the current block. */
-    if ( ( ((nToWrite + a->blksiz) <= a->blkSizeTarget) &&
-             a->blkEvCount < a->blkEvMax) || a->blkEvCount < 1) {
-if (debug) printf("evWrite: do NOT need a new blk header\n");
+
+/* If we have enough room in the current block and have not exceeded
+ * the number of allowed events, then write it in the current block.
+ * Worry about memory later. */
+    if ( ((wordsToWrite + a->blksiz) <= a->blkSizeTarget) &&
+          (a->blkEvCount < a->blkEvMax)) {
+if (debug) printf("evWrite: do NOT need a new blk header: blk size target = %u >= %u bytes,   blk count = %u, max = %u\n",
+                   4*(a->blkSizeTarget), 4*(wordsToWrite + a->blksiz), a->blkEvCount, a->blkEvMax);
         writeNewBlockHeader = 0;
     }
     else if (debug) {
-printf("evWrite: DO need a new blk header: blkTarget = %u, will use %u (words)\n",
-                 a->blkSizeTarget, (nToWrite + a->blksiz + EV_HDSIZ) );
+printf("evWrite: DO need a new blk header: blk size target = %u < %u bytes,   blk count = %u, max = %u\n",
+                 4*(a->blkSizeTarget), 4*(wordsToWrite + a->blksiz + EV_HDSIZ), a->blkEvCount, a->blkEvMax);
         if (a->blkEvCount >= a->blkEvMax) {
 printf("evWrite: too many events in block, already have %u\n", a->blkEvCount );
         }
     }
 
-    
+
     /* Are we splitting files in general? */
     while (a->splitting) {
-        int headerCount=0;
         uint64_t totalSize;
-        
-        /* If all that is written so far is a dictionary, don't split after writing it */
-        if (a->wroteDictionary && (a->blknum - 1) == 1 && a->eventsToBuf < 2) {
-if (debug) printf("evWrite: don't split file cause only dictionary written so far\n");
+
+        /* If it's the first block and all that is written so far are the dictionary and first event,
+         * don't split after writing it. */
+        if (a->blknum == 2 && a->eventsToBuf <= a->commonBlkCount) {
+if (debug) printf("evWrite: don't split file cause only common block written so far\n");
             break;
         }
         
         /* Is this event (together with the current buffer, current file,
-         * and various block headers) large enough to split the file? */
-        totalSize = a->bytesToFile + 4*nToWrite + a->bytesToBuf;
+         *  and ending block header) large enough to split the file? */
+        totalSize = a->bytesToFile + bytesToWrite + a->bytesToBuf + headerBytes;
 
-        /* If we have to add another block header, account for it.
-         * But only if it doesn't write over an existing ending block.*/
-        if (writeNewBlockHeader && a->bytesToFile < 1) {
+        /* If we have to add another block header before this event, account for it. */
+        if (writeNewBlockHeader) {
             totalSize += headerBytes;
-            headerCount++;
-if (debug) printf("evWrite: account for another block header when splitting\n");
-        }
-        
-        /* If an ending empty block was not added yet (first time thru), account for it */
-        if (isLastBlock(a->currentHeader)) {
-if (debug) printf("evWrite: account for adding empty last block when splitting\n");
-            totalSize += headerBytes;
-            headerCount++;
         }
 
-/* If dictionary was written, do NOT include that when deciding to split */
-/* totalSize -= a->dictLength; */
+if (debug) {
+    printf("evWrite: splitting = %s: total size = %llu >? split = %llu\n",
+           (totalSize > a->split ? "True" : "False"), totalSize, a->split);
 
-if (debug) printf("evWrite: splitting = %s: total size = %llu >? split = %llu\n",
-                          (totalSize > a->split ? "True" : "False"),
-                          totalSize, a->split);
-
-if (debug) printf("evWrite: total size components: bytesToFile = %llu, bytesToBuf = %u, ev bytes = %u, additional headers = %d * 32, dictlen = %u\n",
-        a->bytesToFile, a->bytesToBuf, 4*nToWrite, headerCount, a->dictLength);
+    printf("evWrite: total size components: bytesToFile = %llu, bytesToBuf = %u, ev bytes = %u, dictlen = %u\n",
+           a->bytesToFile, a->bytesToBuf, bytesToWrite, a->dictLength);
+}
 
         /* If we're going to split the file ... */
         if (totalSize > a->split) {
@@ -4184,6 +4561,7 @@ if (debug) printf("evWrite: total size components: bytesToFile = %llu, bytesToBu
             /* Flush the current buffer if any events contained and prepare
              * for a new file (split) to hold the current event. */
             if (a->eventsToBuf > 0) {
+if (debug) printf("evWrite: eventsToBuf > 0 so doFlush = 1\n");
                 doFlush = 1;
             }
         }
@@ -4192,19 +4570,19 @@ if (debug) printf("evWrite: total size components: bytesToFile = %llu, bytesToBu
     }
 
     
-if (debug) printf("evWrite: bufSize = %u <? bytesToWrite = %u + 64 = %u \n",
-                        (4*a->bufSize), (4*nToWrite), (4*nToWrite + 64));
+if (debug) printf("evWrite: bufSize = %u <? bytesToWrite = %u + 64 = %u, events in buf = %u\n",
+                        (4*a->bufSize), (a->bytesToBuf + bytesToWrite),
+                        (a->bytesToBuf + bytesToWrite + 64), a->eventsToBuf);
 
     
     /* Is this event (by itself) too big for the current internal buffer?
      * Internal buffer needs room for first block header, event, and ending empty block. */
-    if (4*a->bufSize < 4*nToWrite + 2*headerBytes) {
+    if (4*a->bufSize < bytesToWrite + 2*headerBytes) {
         /* Not enough room in user-supplied buffer for this event */
         if (a->rw == EV_WRITEBUF) {
-            if (useMutex) {
-                mutexUnlock(a);
-                handleReadUnlock(handle);
-            }
+            if (useMutex) handleUnlock(handle);
+if (debug) printf("evWrite: error, bufSize = %u <? current event bytes = %u + 2 headers (64), total = %u, room = %u\n",
+                  (4*a->bufSize), bytesToWrite, (bytesToWrite + 64), (4*a->bufSize - a->bytesToBuf - headerBytes));
             return(S_EVFILE_TRUNC);
         }
         
@@ -4213,29 +4591,25 @@ if (debug) printf("evWrite: bufSize = %u <? bytesToWrite = %u + 64 = %u \n",
 if (debug) printf("evWrite: NEED another buffer & block for 1 big event, bufferSize = %d bytes\n",
                (4*a->bufSize));
     }
-    /* Is this event, in combination with events previously written
-     * to the current internal buffer, too big for it? Remember, if we're here,
-     * events were previously written to this block and therefore an ending
-     * empty block has already been written and included in a->bytesToBuf.
-     * Also, if we're here, this event is not a dictionary. */
-    else if ((!writeNewBlockHeader && ((4*a->bufSize - a->bytesToBuf) < 4*nToWrite)) ||
-             ( writeNewBlockHeader && ((4*a->bufSize - a->bytesToBuf) < 4*nToWrite + headerBytes)))  {
+
+    /* Is this event plus ending block header, in combination with events previously written
+     * to the current internal buffer, too big for it? */
+    else if ((!writeNewBlockHeader && ((4*a->bufSize - a->bytesToBuf) < bytesToWrite + headerBytes)) ||
+             ( writeNewBlockHeader && ((4*a->bufSize - a->bytesToBuf) < bytesToWrite + 2*headerBytes)))  {
+
         /* Not enough room in user-supplied buffer for this event */
         if (a->rw == EV_WRITEBUF) {
-            if (useMutex) {
-                mutexUnlock(a);
-                handleReadUnlock(handle);
-            }
+            if (useMutex) handleUnlock(handle);
             return(S_EVFILE_TRUNC);
         }
         
         if (debug) {
 printf("evWrite: NEED to flush buffer and re-use, ");
             if (writeNewBlockHeader) {
-printf(" buf room = %d, needed = %d\n", (4*a->bufSize - a->bytesToBuf), (4*nToWrite + headerBytes));
+printf(" buf room = %d, needed = %d\n", (4*a->bufSize - a->bytesToBuf), (bytesToWrite + 2*headerBytes));
             }
             else {
-printf(" buf room = %d, needed = %d\n", (4*a->bufSize - a->bytesToBuf), (4*nToWrite));
+printf(" buf room = %d, needed = %d\n", (4*a->bufSize - a->bytesToBuf), (bytesToWrite + headerBytes));
             }
         }
         roomInBuffer = 0;
@@ -4247,22 +4621,21 @@ printf(" buf room = %d, needed = %d\n", (4*a->bufSize - a->bytesToBuf), (4*nToWr
         if (needBiggerBuffer) {
             /* We're here because there is not enough room in the internal buffer
              * to write this single large event. Increase buffer to match. */
-            size = 4*(nToWrite + 2*EV_HDSIZ);
+            size = 4*(wordsToWrite + 2*EV_HDSIZ);
 if (debug) printf("         must expand, bytes needed for 1 big ev + 2 hdrs = %d\n", size);
         }
         
         /* Flush what we have to file (if anything) */
+        if (debug) printf("evWrite: no room in Buf so doFlush = 1\n");
         doFlush = 1;
     }
 
     /* Do we flush? */
     if (doFlush) {
-        status = evFlush(a);
+//printf("evWrite: call flushToFile 1\n");
+        status = flushToFile(a, 0, NULL);
         if (status != S_SUCCESS) {
-            if (useMutex) {
-                mutexUnlock(a);
-                handleReadUnlock(handle);
-            }
+            if (useMutex) handleUnlock(handle);
             return status;
         }
     }
@@ -4271,10 +4644,7 @@ if (debug) printf("         must expand, bytes needed for 1 big ev + 2 hdrs = %d
     if (splittingFile) {
         fileActuallySplit = splitFile(a);
         if (fileActuallySplit == S_FAILURE) {
-            if (useMutex) {
-                mutexUnlock(a);
-                handleReadUnlock(handle);
-            }
+            if (useMutex) handleUnlock(handle);
             return S_FAILURE;
         }
     }
@@ -4284,10 +4654,7 @@ if (debug) printf("         must expand, bytes needed for 1 big ev + 2 hdrs = %d
         /* If here, we just flushed. */
         status = expandBuffer(a, size);
         if (status != S_SUCCESS) {
-            if (useMutex) {
-                mutexUnlock(a);
-                handleReadUnlock(handle);
-            }
+            if (useMutex) handleUnlock(handle);
             return status;
         }
     }
@@ -4295,7 +4662,8 @@ if (debug) printf("         must expand, bytes needed for 1 big ev + 2 hdrs = %d
     /* If we either flushed events or split the file, reset the
      * internal buffer to prepare it for writing another event. */
     if (doFlush || splittingFile) {
-        resetBuffer(a);
+//printf("evWrite: call resetBuffer(0) 1\n");
+        resetBuffer(a, 0);
         /* We have a newly initialized buffer ready to write
          * to, so we don't need a new block header. */
         writeNewBlockHeader = 0;
@@ -4308,36 +4676,31 @@ if (debug) printf("         must expand, bytes needed for 1 big ev + 2 hdrs = %d
     /*********************************************************************/
     /* Before we go on, if the file was actually split, we must add any
      * existing dictionary as the first event & block in the new file
-     * before we write the event. */
+     * followed by the first event before we write the given event. */
     /*********************************************************************/
-    if (fileActuallySplit && a->dictionary != NULL) {
-        /* Memory needed to write: dictionary + 3 block headers
-         * (beginning, after dict, and ending) + event */
-        uint32_t neededBytes = a->dictLength + 3*4*EV_HDSIZ + 4*nToWrite;
-if (debug) printf("evWrite: write DICTIONARY after splitting, needed bytes = %u\n", neededBytes);
+    if (fileActuallySplit && (a->dictionary != NULL || a->firstEventBuf != NULL)) {
+        /* Memory needed to write: dictionary + first event + 3 block headers
+         * (beginning, after dict &/or first event, and ending) + event */
+        uint32_t neededBytes = a->dictLength + a->firstEventLength + 3*4*EV_HDSIZ + bytesToWrite;
+if (debug) printf("evWrite: write DICTIONARY & FIRST EVENT after splitting, needed bytes = %u\n", neededBytes);
 
-        /* Write block header after dictionary */
+        /* Write block header after dictionary and/or first event */
         writeNewBlockHeader = 1;
 
         /* Give us more buffer memory if we need it. */
         status = expandBuffer(a, neededBytes);
         if (status != S_SUCCESS) {
-            if (useMutex) {
-                mutexUnlock(a);
-                handleReadUnlock(handle);
-            }
+            if (useMutex) handleUnlock(handle);
             return status;
         }
 
-        resetBuffer(a);
+//printf("evWrite: call resetBuffer(1) 2\n");
+        resetBuffer(a, 1);
 
-        /* Write dictionary to the internal buffer */
-        status = evWriteDictImpl(a, a->dictBuf);
+        /* Write common block (dict + first event) to the internal buffer */
+        status = evWriteCommonBlock(a);
         if (status != S_SUCCESS) {
-            if (useMutex) {
-                mutexUnlock(a);
-                handleReadUnlock(handle);
-            }
+            if (useMutex) handleUnlock(handle);
             return status;
         }
 
@@ -4346,47 +4709,33 @@ if (debug) printf("evWrite: write DICTIONARY after splitting, needed bytes = %u\
 
     /* Write new block header if required */
     if (writeNewBlockHeader) {
-        status = writeNewHeader(a, 8, 1, a->blknum++, 0, 0, 1, 0);
+        status = writeNewHeader(a, 1, a->blknum++, 0, 0);
          if (status != S_SUCCESS) {
-             if (useMutex) {
-                 mutexUnlock(a);
-                 handleReadUnlock(handle);
-             }
+             if (useMutex)  handleUnlock(handle);
              return(status);
          }
-         a->bytesToBuf -= 4*EV_HDSIZ; /* write over last empty block */
 if (debug) printf("evWrite: wrote new block header, bytesToBuf = %u\n", a->bytesToBuf);
-    }
-    else {
-if (debug) printf("evWrite: did NOT write new block header, current header info word = 0x%x\n",
-                          a->currentHeader[EV_HD_VER]);
-        
-        /* Write over last empty block ... only if not first write */
-        if (!isLastBlock(a->currentHeader)) {
-if (debug) printf("evWrite: no block header WRITE OVER LAST EMPTY BLOCK\n");
-            a->bytesToBuf -= 4*EV_HDSIZ;
-        }
     }
 
     /******************************************/
     /* Write the event to the internal buffer */
     /******************************************/
-    writeEventToBuffer(a, buffer, nToWrite, isDictionary);
+    writeEventToBuffer(a, buffer, wordsToWrite, 0);
 
 if (debug) {
         printf("evWrite: after last header written, Events written to:\n");
         printf("         cnt total (no dict) = %u\n", a->eventCount);
         printf("         file cnt total = %u\n", a->eventsToFile);
         printf("         internal buffer cnt = %u\n", a->eventsToBuf);
-        printf("         block cnt = %u\n", a->blkEvCount);
+        printf("         common block cnt = %u\n", a->commonBlkCount);
+        printf("         current block cnt (dict) = %u\n", a->blkEvCount);
         printf("         bytes-to-buf  = %u\n", a->bytesToBuf);
         printf("         bytes-to-file = %llu\n", a->bytesToFile);
         printf("         block # = %u\n", a->blknum);
 }
 
     if (useMutex) {
-        mutexUnlock(a);
-        handleReadUnlock(handle);
+        handleUnlock(handle);
     }
 
     return(S_SUCCESS);
@@ -4394,31 +4743,130 @@ if (debug) {
 
 
 /**
- * This routine writes any existing evio format data in an internal buffer
- * (written to with {@link evWrite}) to the final destination
- * file/socket opened with routines {@link evOpen} or {@link evOpenSocket}.
+ * @defgroup write write routines
+ * These routines handle opening the ev lib for writing to a file, buffer, or socket.
+ * @{
+ */
+
+
+/**
+ * This routine writes an evio event to an internal buffer containing evio data.
+ * If that internal buffer is full, it is flushed to the final destination
+ * file/socket/buffer/pipe opened with routines {@link #evOpen}, {@link #evOpenBuffer},
+ * or {@link #evOpenSocket}.
  * It writes data in evio version 4 format and returns a status.
- * If writing to a file, it always places an empty block
- * at the end - marked as the last block. If more events are written, the
- * last block is overwritten.<p>
+ *
+ * @param handle evio handle
+ * @param buffer pointer to buffer containing event to write
+ *
+ * @return S_SUCCESS          if successful
+ * @return S_EVFILE_BADMODE   if opened for reading or appending to opposite endian file/buffer.
+ * @return S_EVFILE_TRUNC     if not enough room writing to a user-supplied buffer
+ * @return S_EVFILE_BADARG    if buffer is NULL
+ * @return S_EVFILE_BADHANDLE if bad handle arg
+ * @return S_EVFILE_ALLOCFAIL if cannot allocate memory
+ * @return errno              if file/socket write error
+ * @return stream error       if file stream error
+ */
+int evWrite(int handle, const uint32_t *buffer) {
+    return evWriteImpl(handle, buffer, 1);
+}
+
+
+/**
+ * This function flushes any remaining internally buffered data to file/socket.
+ * Calling {@link #evClose} automatically does this so it isn't necessary
+ * to call before closing. This method should only be used when writing
+ * events at such a low rate that it takes an inordinate amount of time
+ * for internally buffered data to be written to the file.<p>
+ *
+ * Calling this can kill performance if writing to a hard disk!
+ *
+ * @param handle evio handle
+ *
+ * @return S_SUCCESS          if successful
+ * @return S_EVFILE_BADHANDLE if bad handle arg
+ */
+int evFlush(int handle) {
+
+    EVFILE *a;
+    int wroteData=0, debug=0;
+
+
+    if (handle < 1 || handle > handleCount) {
+        return(S_EVFILE_BADHANDLE);
+    }
+
+    /* For thread-safe function calls */
+    handleLock(handle);
+
+    /* Look up file struct from handle */
+    a = handleList[handle-1];
+
+    /* If already closed, ignore */
+    if (a == NULL) {
+        handleUnlock(handle);
+        return(S_SUCCESS);
+    }
+
+    /*
+     * Only for writing. Also, if lastEmptyBlockHeaderExists is true, then resetBuffer
+     * has been called and no events have been written into buffer yet.
+     * In other words, no need to flush an empty, last block header.
+     * That is only done in evClose().
+     */
+if (debug) printf("evFlush: call lastEmptyBlockHeaderExists = %d\n", a->lastEmptyBlockHeaderExists);
+    if (((a->rw != EV_WRITEFILE) && (a->rw != EV_WRITEPIPE) && (a->rw != EV_WRITESOCK)) ||
+          a->lastEmptyBlockHeaderExists) {
+        handleUnlock(handle);
+        return(S_SUCCESS);
+    }
+
+    /* Flush everything then clear & write the last empty block into internal buffer.
+     * This will kill performance when writing to hard disk! */
+    flushToFile(a, 1, &wroteData);
+    if (wroteData) {
+        /* If we actually wrote some data, start a new block */
+        resetBuffer(a, 0);
+    }
+
+    handleUnlock(handle);
+
+    return(S_SUCCESS);
+}
+
+
+/** @} */
+
+
+/**
+ * This routine writes any existing evio format data in an internal buffer
+ * (written to with {@link #evWrite}) to the final destination
+ * file/socket opened with routines {@link #evOpen} or {@link #evOpenSocket}.
+ * It writes data in evio version 4 format.<p>
  * This will not overwrite an existing file if splitting is enabled.
  *
- * @param a  pointer to data structure
+ * @param a         pointer to data structure
+ * @param force     if non-zero, force it to write event to the disk.
+ * @param wroteData pointer to int which gets filled with 0 if no data written, else 1.
+ *                  If an error is returned, int's value is not changed.
  *
- * @return S_SUCCESS  if successful
+ * @return S_SUCCESS if successful
  * @return S_FAILURE  if file could not be opened for writing;
  *                    if file exists already and splitting;
  *                    if file name could not be generated;
- *                    if error writing event;
+ *                    if error writing data;
  */
-static int evFlush(EVFILE *a) {
-    long pos;
-    uint32_t nBytes=0, debug=0, bytesToWrite=0, blockHeaderBytes = 4*EV_HDSIZ;
+static int flushToFile(EVFILE *a, int force, int *wroteData) {
 
-    
+    size_t nBytes=0;
+    uint32_t debug=0, bytesToWrite=0;
+
+
     /* If nothing to write ... */
-    if (a->eventsToBuf < 1) {
-if (debug) printf("    evFlush: no events to write\n");
+    if (a->bytesToBuf < 1) {
+if (debug) printf("    flushToFile: no events to write\n");
+        if (wroteData != NULL) *wroteData = 0;
         return(S_SUCCESS);
     }
 
@@ -4427,26 +4875,30 @@ if (debug) printf("    evFlush: no events to write\n");
     
     /* Write internal buffer out to socket, file, or pipe */
     if (a->rw == EV_WRITESOCK) {
-        /* Unlike the file, do NOT write out the last, empty block now.
-         * Otherwise the receiving socket will end it's reading of
-         * events. Do that only when closing. */
-        bytesToWrite = a->bytesToBuf - 4*EV_HDSIZ;
-if (debug) printf("    evFlush: write %u events to SOCKET\n", a->eventsToBuf);
-        nBytes = tcpWrite(a->sockFd, a->buf, bytesToWrite);
+if (debug) printf("    flushToFile: write %u events to SOCKET\n", a->eventsToBuf);
+        nBytes = (size_t) tcpWrite(a->sockFd, a->buf, bytesToWrite);
+        /* Return any error condition of write attempt */
+        if (nBytes != bytesToWrite) {
+if (debug) printf("    flushToFile: did NOT write correct number of bytes\n");
+            /* It's possible some bytes were written over socket before error */
+            return(S_FAILURE);
+        }
     }
     else if (a->rw == EV_WRITEPIPE) {
-        /* Unlike the file, do NOT write out the last, empty block now.
-         * Otherwise the receiving program will end it's reading of
-         * events. Do that only when closing. */
-        bytesToWrite = a->bytesToBuf - 4*EV_HDSIZ;
-if (debug) printf("    evFlush: write %u events to PIPE\n", a->eventsToBuf);
-        /* Write block to file */
-        nBytes = fwrite((const void *)a->buf, 1, bytesToWrite, a->file);
-        /* Return any error condition of file stream */
-        if (ferror(a->file)) return(S_FAILURE);
+if (debug) printf("    flushToFile: write %u events to PIPE\n", a->eventsToBuf);
+
+        /* It may take more than one fwrite to write all data */
+        while (nBytes < bytesToWrite) {
+            char *pBuf = (char *)(a->buf) + nBytes;
+            /* Write block to file */
+            nBytes += fwrite((const void *)pBuf, 1, bytesToWrite - nBytes, a->file);
+
+            /* Return for error condition of file stream */
+            if (ferror(a->file)) return(S_FAILURE);
+        }
     }
     else if (a->rw == EV_WRITEFILE) {
-if (debug) printf("    evFlush: write %u events to FILE\n", a->eventsToBuf);
+if (debug) printf("    flushToFile: write %u events to FILE\n", a->eventsToBuf);
         /* Clear EOF and error indicators for file stream */
         if (a->file != NULL) clearerr(a->file);
 
@@ -4460,21 +4912,21 @@ if (debug) printf("    evFlush: write %u events to FILE\n", a->eventsToBuf);
                 if (a->fileName == NULL) {
                     /* Generate actual file name from base name */
                     char *fname = evGenerateFileName(a, a->specifierCount, a->runNumber,
-                                                     (a->splitting? a->split : 0),
-                                                      a->splitNumber++, a->runType);
+                                                     a->splitting, a->splitNumber++,
+                                                     a->runType, a->streamId);
                     if (fname == NULL) {
                         return(S_FAILURE);
                     }
                     a->fileName = fname;
-if (debug) printf("    evFlush: generate first file name = %s\n", a->fileName);
+/*if (debug) printf("    flushToFile: generate first file name = %s\n", a->fileName);*/
                 }
 
-if (debug) printf("    evFlush: create file = %s\n", a->fileName);
+if (debug) printf("    flushToFile: create file = %s\n", a->fileName);
 
                 /* If splitting, don't overwrite a file ... */
                 if (a->splitting) {
                     if (fileExists(a->fileName)) {
-if (1) printf("    evFlush: will not overwrite file = %s\n", a->fileName);
+printf("    flushToFile: will not overwrite file = %s\n", a->fileName);
                         return(S_FAILURE);
                     }
                 }
@@ -4485,35 +4937,43 @@ if (1) printf("    evFlush: will not overwrite file = %s\n", a->fileName);
                 }
             }
         }
-        /* If appending to existing data, write over last block header (back up 32 bytes) */
-        else {
-if (debug) printf("    evFlush: append\n");
-            /* Carefully change unsigned int (blockHeaderBytes) into neg # */
-            pos = -1L * blockHeaderBytes;
-            fseek(a->file, pos, SEEK_CUR);
+/*if (debug) printf("    flushToFile: write %d bytes\n", bytesToWrite);*/
+
+        /* It may take more than one fwrite to write all data */
+        while (nBytes < bytesToWrite) {
+            char *pBuf = (char *)(a->buf) + nBytes;
+            /* Write block to file */
+            nBytes += fwrite((const void *)pBuf, 1, bytesToWrite - nBytes, a->file);
+
+            /* Return for error condition of file stream */
+            if (ferror(a->file)) return(S_FAILURE);
         }
-if (debug) printf("    evFlush: write %d bytes\n", bytesToWrite);
 
-        /* Write block to file */
-        nBytes = fwrite((const void *)a->buf, 1, bytesToWrite, a->file);
-
-// I suspect this line kills performance so just remove it for now.
-//        fflush(a->file);
-        
-        /* Return for error condition of file stream */
-        if (ferror(a->file)) return(S_FAILURE);
-    }
-
-    /* Return any error condition of write attempt */
-    if (nBytes != bytesToWrite) {
-if (debug) printf("    evFlush: did NOT write all bytes!!!\n");
-        return(S_FAILURE);
+        if (force) {
+            fflush(a->file);
+        }
     }
 
     a->bytesToFile  += bytesToWrite;
     a->eventsToFile += a->eventsToBuf;
-    
-if (debug) printf("    evFlush: file cnt total = %u\n", a->eventsToFile);
+
+    if (debug) {
+        printf("    flushToFile: after last header written, Events written to:\n");
+        printf("         cnt total (no dict) = %u\n", a->eventCount);
+        printf("         file cnt total (dict) = %u\n", a->eventsToFile);
+        printf("         internal buffer cnt (dict) = %u\n", a->eventsToBuf);
+        printf("         current block cnt (dict) = %u\n", a->blkEvCount);
+        printf("         bytes-written = %u\n", bytesToWrite);
+        printf("         bytes-to-file = %u\n", a->bytesToFile);
+        printf("         block # = %u\n", a->blknum);
+    }
+
+    /* Everything flushed, nothing left in internal buffer, go back to top of buf */
+    a->next = a->buf;
+    a->bytesToBuf = 0;
+    a->eventsToBuf = 0;
+
+    if (wroteData != NULL) *wroteData = 1;
 
     return(S_SUCCESS);
 }
@@ -4542,17 +5002,29 @@ static int splitFile(EVFILE *a) {
         return(0);
     }
 
+    // We need to end the file with an empty block header.
+    // However, if resetBuffer (or flush) was just called,
+    // a last block header will already exist.
+    if (a->eventsToBuf > 0 || a->bytesToBuf < 1) {
+if(debug) printf("    splitFile: write last empty header\n");
+        writeNewHeader(a, 0, a->blknum, 0, 1);
+    }
+    //printf("    splitFile: call flushToFile for file being closed\n");
+    flushToFile(a, 1, NULL);
+
+
     /* Reset first-block & file values for reuse */
     a->blknum = 1;
     a->bytesToFile  = 0;
     a->eventsToFile = 0;
+    a->wroteDictionary = 0;
 
     /* Close file */
     if (a->rw == EV_WRITEFILE) {
         if (a->randomAccess) {
             err = munmap(a->mmapFile, a->mmapFileSize);
             if (err < 0) {
-if (debug) printf("splitFile: error unmapping memory, %s\n", strerror(errno));
+if (debug) printf("    splitFile: error unmapping memory, %s\n", strerror(errno));
                 status = -1;
             }
             
@@ -4565,7 +5037,7 @@ if (debug) printf("splitFile: error unmapping memory, %s\n", strerror(errno));
                 err = fclose(a->file);
             }
             if (err == EOF) {
-if (debug) printf("splitFile: error closing file, %s\n", strerror(errno));
+if (debug) printf("    splitFile: error closing file, %s\n", strerror(errno));
                 status = -1;
             }
         }
@@ -4576,7 +5048,8 @@ if (debug) printf("splitFile: error closing file, %s\n", strerror(errno));
 
     /* Create the next file's name */
     fname = evGenerateFileName(a, a->specifierCount, a->runNumber,
-                               a->split, a->splitNumber++, a->runType);
+                               a->splitting, a->splitNumber++,
+                               a->runType, a->streamId);
     if (fname == NULL) {
         return(-1);
     }
@@ -4593,121 +5066,106 @@ if (debug) printf("    splitFile: generate next file name = %s\n", a->fileName);
 }
 
 
-/** Fortran interface to {@link evClose}. */
-#ifdef AbsoftUNIXFortran
-int evclose
-#else
-int evclose_
-#endif
-(int *handle)
-{
-    return(evClose(*handle));
-}
+/**
+ * @addtogroup open
+ * @{
+ */
 
 
 /**
  * This routine flushes any existing evio format data in an internal buffer
- * (written to with {@link evWrite}) to the final destination
- * file/socket/buffer opened with routines {@link evOpen}, {@link evOpenBuffer},
- * or {@link evOpenSocket}.
+ * (written to with {@link #evWrite}) to the final destination
+ * file/socket/buffer opened with routines {@link #evOpen}, {@link #evOpenBuffer},
+ * or {@link #evOpenSocket}.
  * It also frees up the handle so it cannot be used any more without calling
- * {@link evOpen} again.
+ * {@link #evOpen} again.
  * Any data written is in evio version 4 format and any opened file is closed.
  * If reading, nothing is done.
  *
  * @param handle evio handle
  *
  * @return S_SUCCESS          if successful
- * @return S_FAILURE          if mapped memory does not unmap or pclose() failed
- * @return S_EVFILE_TRUNC     if not enough room writing to a user-given buffer in {@link evOpen}
- * @return S_EVFILE_BADHANDLE if bad handle arg
+ * @return S_FAILURE          if mapped memory does not unmap or write/close failed
+ * @return S_EVFILE_TRUNC     if not enough room writing to a user-given buffer in {@link #evOpen}
+ * @return S_EVFILE_BADHANDLE if bad handle arg or this function already called.
  * @return fclose error       if fclose error
  */
 int evClose(int handle)
 {
     EVFILE *a;
-    int debug=0, status = S_SUCCESS, status2 = S_SUCCESS;
-    int nBytes, bytesToWrite;
-    
+    int debug=0, status = S_SUCCESS;
+
+    if (debug) printf("evClose: in\n");
 
     if (handle < 1 || handle > handleCount) {
         return(S_EVFILE_BADHANDLE);
     }
 
-if (debug) printf("evClose: try to grab evClose() mutex\n");
-    /* Don't let no one get no "a" while we're closing anything */
-    handleWriteLock(handle);
+    /* For thread-safe function calls */
+    handleLock(handle);
 
     /* Look up file struct from handle */
     a = handleList[handle-1];
 
     /* Check arg */
     if (a == NULL) {
-        handleWriteUnlock(handle);
+        handleUnlock(handle);
         return(S_EVFILE_BADHANDLE);
     }
 
-if (debug) printf("  evClose: in\n");
-
-    /* Flush everything to file/socket if writing */
-    if (a->rw == EV_WRITEFILE || a->rw == EV_WRITEPIPE || a->rw == EV_WRITESOCK)  {
-        /* Write last block. If no events left to write,
-         * just write an empty block (header only). */
-        evFlush(a);
-    }
-
-    /* For writing to sockets or pipes, send the last empty block now */
-    if (a->rw == EV_WRITEPIPE || a->rw == EV_WRITESOCK) {
-        /* Mark this block as the last one to be written. */
-        resetBuffer(a);
-        bytesToWrite = 4*EV_HDSIZ;
-       
-        if (a->rw == EV_WRITESOCK) {
-if (debug) printf("    evClose: send last empty block over socket\n");
-            nBytes = tcpWrite(a->sockFd, a->buf, bytesToWrite);
-            if (nBytes != bytesToWrite) {
-if (debug) printf("    evClose: didn't write all bytes, err = %s\n", strerror(errno));
-                return(errno);
-            }
+    /* If file writing ... */
+    if (a->rw == EV_WRITEFILE || a->rw == EV_WRITEPIPE || a->rw == EV_WRITESOCK) {
+        // We need to end the file with an empty block header.
+        // However, if resetBuffer (or flush) was just called,
+        // a last block header will already exist.
+        if (a->eventsToBuf > 0 || a->bytesToBuf < 1) {
+if(debug) printf("evClose: write header, free bytes In Buffer = %d\n", (int)(a->bufSize - a->bytesToBuf));
+            writeNewHeader(a, 0, a->blknum, 0, 1);
         }
-        else if (a->rw == EV_WRITEPIPE) {
-if (debug) printf("    evClose: send last empty block over pipe\n");
-            nBytes = fwrite((const void *)a->buf, 1, bytesToWrite, a->file);
-            if (nBytes != bytesToWrite) {
-if (debug) printf("    evClose: didn't write all bytes, err = %s\n", strerror(errno));
-                return(errno);
-            }
-        }
+        flushToFile(a, 1, NULL);
     }
-
+    else if ( a->rw == EV_WRITEBUF) {
+        writeNewHeader(a, 0, a->blknum, 0, 1);
+    }
 
     /* Close file */
     if (a->rw == EV_WRITEFILE || a->rw == EV_READFILE) {
         if (a->randomAccess) {
-            status2 = munmap(a->mmapFile, a->mmapFileSize);
+            status = munmap(a->mmapFile, a->mmapFileSize);
             if (a->pTable != NULL) free(a->pTable);
+            if (status < 0) status = S_FAILURE;
+            else status = S_SUCCESS;
         }
         else {
-            if (a->file != NULL) status2 = fclose(a->file);
+            if (a->file != NULL) status = fclose(a->file);
+            if (status == EOF) status = S_FAILURE;
+            else status = S_SUCCESS;
         }
     }
     /* Pipes requires special close */
     else if (a->rw == EV_READPIPE || a->rw == EV_WRITEPIPE) {
         if (a->file != NULL) {
-            status2 = pclose(a->file);
-            if (status2 < 0) status2 = S_FAILURE;
-            else status2 = S_SUCCESS;
+            status = pclose(a->file);
+            if (status < 0) status = S_FAILURE;
+            else status = S_SUCCESS;
         }
     }
 
     /* Free up resources */
-    if (a->buf != NULL && a->rw != EV_WRITEBUF) free((void *)(a->buf));
+    if (a->buf != NULL && a->rw != EV_WRITEBUF) {
+        if (a->pBuf != NULL) {
+            free((void *)(a->pBuf));
+        }
+        else {
+            free((void *) (a->buf));
+        }
+    }
     if (a->dictBuf      != NULL) free(a->dictBuf);
     if (a->dictionary   != NULL) free(a->dictionary);
     if (a->fileName     != NULL) free(a->fileName);
     if (a->baseFileName != NULL) free(a->baseFileName);
     if (a->runType      != NULL) free(a->runType);
-    structDestroy(a);
+
     free((void *)a);
     
     /* Remove this handle from the list */
@@ -4715,20 +5173,25 @@ if (debug) printf("    evClose: didn't write all bytes, err = %s\n", strerror(er
     handleList[handle-1] = 0;
     getHandleUnlock();
 
-    handleWriteUnlock(handle);
-if (debug) printf("evClose: release close mutex\n");
-    
-    if (status == S_SUCCESS) {
-        status = status2;
-    }
-    
+    handleUnlock(handle);
+if (debug) printf("evClose: end\n");
+
     return(status);
 }
 
 
+/** @} */
+
+
+/**
+ * @defgroup getAndSet get and set routines
+ * These routines handle getting and setting evio parameters.
+ * @{
+ */
+
 /**
  * This routine returns the number of bytes written into a buffer so
- * far when given a handle provided by calling {@link evOpenBuffer}.
+ * far when given a handle provided by calling {@link #evOpenBuffer}.
  * After the handle is closed, this no longer returns anything valid.
  *
  * @param handle evio handle
@@ -4747,44 +5210,25 @@ int evGetBufferLength(int handle, uint32_t *length)
         return(S_EVFILE_BADHANDLE);
     }
 
-    /* Don't allow simultaneous calls to evClose(), but do allow reads & writes. */
-    handleReadLock(handle);
+    /* For thread-safe function calls */
+    handleLock(handle);
 
     /* Look up file struct (which contains block buffer) from handle */
     a = handleList[handle-1];
 
     /* Check arg */
     if (a == NULL) {
-        handleReadUnlock(handle);
+        handleUnlock(handle);
         return(S_EVFILE_BADHANDLE);
     }
     
     if (length != NULL) {
         *length = a->rwBytesOut;
     }
-    
-    handleReadUnlock(handle);
+
+    handleUnlock(handle);
  
     return(S_SUCCESS);
-}
-
-
-/** Fortran interface to {@link evIoctl}. */
-#ifdef AbsoftUNIXFortran
-int evioctl
-#else
-int evioctl_
-#endif
-(int *handle, char *request, void *argp, int reqlen)
-{
-    char *req;
-    int32_t status;
-    req = (char *)malloc(reqlen+1);
-    strncpy(req,request,reqlen);
-    req[reqlen]=0;		/* insure request is null terminated */
-    status = evIoctl(*handle,req,argp);
-    free(req);
-    return(status);
 }
 
 
@@ -4793,20 +5237,15 @@ int evioctl_
  *
  * It changes the target block size (in 32-bit words) for writes if request = "B".
  * If setting block size fails, writes can still continue with original
- * block size. Minimum size = 1K + 8(header) words. Max size = 5120000 words.<p>
+ * block size. Minimum size = EV_BLOCKSIZE_MIN (1024) words.
+ * Max size = EV_BLOCKSIZE_MAX (33554432) words.<p>
  *
  * It changes size of buffer (in 32-bit words) for writing to file/socket/pipe
- * if request = "W". Must be >= block size + ending header (8).
- * Max size = 5120008 words.<p>
+ * if request = "W". Must be >= target block size (see above) + header (EV_HDSIZ).
+ * Max size = EV_BLOCKSIZE_MAX + EV_HDSIZ (33554444) words.<p>
  *
  * It changes the maximum number of events/block if request = "N".
- * It only goes up to EV_EVENTS_MAX or 100,000.
- * Used only in version 4.<p>
- *
- * It changes the number of bytes at which to split a file
- * being written to if request = "S". If unset with this function,
- * it defaults to EV_SPLIT_SIZE (2GB). NOTE: argp must point to
- * 64 bit integer (not 32 bit)!
+ * It only goes up to EV_EVENTS_MAX (100,000).
  * Used only in version 4.<p>
  *
  * It sets the run number used when auto naming while splitting files
@@ -4817,15 +5256,27 @@ int evioctl_
  * being written to if request = "T".
  * Used only in version 4.<p>
  *
+ * It changes the number of bytes at which to split a file
+ * being written to if request = "S". If unset with this function,
+ * it defaults to EV_SPLIT_SIZE (2GB). NOTE: argp must point to
+ * 64 bit integer (not 32 bit)!
+ * Used only in version 4.<p>
+ *
+ * It sets the stream id used when auto naming files being written to if request = "M".
+ * Used only in version 4.<p>
+ *
+ * It turns the mutex locking for routines' thread safety on/off if request = "X".
+ * Used only in version 4.<p>
+ *
  * It returns the version number if request = "V".<p>
- * 
- * It returns the total number of events in a file/buffer
- * opened for reading or writing if request = "E". Includes any
- * event added with {@link evWrite} call. Used only in version 4.<p>
- * 
+ *
  * It returns a pointer to the EV_HDSIZ block header ints if request = "H".
  * This pointer must be freed by the caller to avoid a memory leak.<p>
- * 
+ *
+ * It returns the total number of events in a file/buffer
+ * opened for reading or writing if request = "E". Includes any
+ * event added with {@link #evWrite} call. Used only in version 4.<p>
+ *
  * NOTE: all request strings are case insensitive. All version 4 commands to
  * version 3 files are ignored.
  *
@@ -4838,6 +5289,8 @@ int evioctl_
  * <LI>  "R"  for setting run number (used in file splitting)
  * <LI>  "T"  for setting run type   (used in file splitting)
  * <LI>  "S"  for setting file split size in bytes
+ * <LI>  "M"  for setting stream id  (used in auto file naming)
+ * <LI>  "X"  for turning off/on the mutex locking of routines for thread safety
  * <LI>  "V"  for getting evio version #
  * <LI>  "H"  for getting 8 ints of block header info
  * <LI>  "E"  for getting # of events in file/buffer
@@ -4850,8 +5303,10 @@ int evioctl_
  * <LI> pointer to uin32_t containing new max # of events/block if request = N, or
  * <LI> pointer to uin32_t containing run number if request = R, or
  * <LI> pointer to character containing run type if request = T, or
- * <LI> pointer to int32_t returning version # if request = V, or
  * <LI> pointer to <b>uint64_t</b> containing max size in bytes of split file if request = S, or
+ * <LI> pointer to uin32_t containing stream id if request = M, or
+ * <LI> pointer to uin32_t containing 0 (off) or non-zero (on) if request = X, or
+ * <LI> pointer to int32_t returning version # if request = V, or
  * <LI> address of pointer to uint32_t returning pointer to 8
  *              uint32_t's of block header if request = H. This pointer must be
  *              freed by caller since it points to allocated memory
@@ -4883,25 +5338,24 @@ int evIoctl(int handle, char *request, void *argp)
     uint32_t  eventsMax, blockSize, bufferSize, runNumber;
     uint64_t  splitSize;
 
-    
     if (handle < 1 || handle > handleCount) {
         return(S_EVFILE_BADHANDLE);
     }
-    
-    /* Don't allow simultaneous calls to evClose, reads & writes. */
-    handleWriteLock(handle);
+
+    /* For thread-safe function calls */
+    handleLock(handle);
 
     /* Look up file struct from handle */
     a = handleList[handle-1];
 
     /* Check args */
     if (a == NULL) {
-        handleWriteUnlock(handle);
+        handleUnlock(handle);
         return(S_EVFILE_BADHANDLE);
     }
     
     if (request == NULL) {
-        handleWriteUnlock(handle);
+        handleUnlock(handle);
         return(S_EVFILE_BADARG);
     }
 
@@ -4911,9 +5365,10 @@ int evIoctl(int handle, char *request, void *argp)
         /*******************************/
         case 'b':
         case 'B':
+if (debug) printf("evIoctl: trying to set block target size\n");
             /* Need to specify block size */
             if (argp == NULL) {
-                handleWriteUnlock(handle);
+                handleUnlock(handle);
                 return(S_EVFILE_BADARG);
             }
 
@@ -4922,18 +5377,19 @@ int evIoctl(int handle, char *request, void *argp)
                 a->rw != EV_WRITEPIPE &&
                 a->rw != EV_WRITESOCK &&
                 a->rw != EV_WRITEBUF) {
-                handleWriteUnlock(handle);
+                handleUnlock(handle);
                 return(S_EVFILE_BADSIZEREQ);
             }
 
             /* If not appending AND events already written ... */
-            if (a->append == 0 && (a->blknum != 1 || a->blkEvCount != 0)) {
-                handleWriteUnlock(handle);
+            if (a->append == 0 && (a->blknum != 2 || a->blkEvCount != 0)) {
+if (debug) printf("evIoctl: error setting block target size, not appending and events already written\n");
+                handleUnlock(handle);
                 return(S_EVFILE_BADSIZEREQ);
             }
             /* Else appending AND events already appended ... */
             else if (a->append > 1) {
-                handleWriteUnlock(handle);
+                handleUnlock(handle);
                 return(S_EVFILE_BADSIZEREQ);
             }
 
@@ -4942,19 +5398,21 @@ int evIoctl(int handle, char *request, void *argp)
 
             /* If there is no change, return success */
             if (blockSize == a->blkSizeTarget) {
-                handleWriteUnlock(handle);
+                handleUnlock(handle);
                 return(S_SUCCESS);
             }
             
             /* If it's too small, return error */
             if (blockSize < EV_BLOCKSIZE_MIN) {
-                handleWriteUnlock(handle);
+if (debug) printf("evIoctl: error setting block target size, too small, must be >= %d\n", EV_BLOCKSIZE_MIN);
+                handleUnlock(handle);
                 return(S_EVFILE_BADSIZEREQ);
             }
 
             /* If it's too big, return error */
             if (blockSize > EV_BLOCKSIZE_MAX) {
-                handleWriteUnlock(handle);
+if (debug) printf("evIoctl: error setting block target size, too big, must be <= %d\n", EV_BLOCKSIZE_MAX);
+                handleUnlock(handle);
                 return(S_EVFILE_BADSIZEREQ);
             }
 
@@ -4962,10 +5420,10 @@ int evIoctl(int handle, char *request, void *argp)
             if (blockSize + EV_HDSIZ > a->bufRealSize && a->rw != EV_WRITEBUF) {
                 /* Allocate buffer memory for increased block size. If this fails
                  * we can still (theoretically) continue with writing. */
-if (debug) printf("INcreasing block size to %u words\n", (blockSize + EV_HDSIZ));
+if (debug) printf("evIoctl: increasing buffer size to %u words\n", (blockSize + EV_HDSIZ));
                 newBuf = (uint32_t *) malloc(4*(blockSize + EV_HDSIZ));
                 if (newBuf == NULL) {
-                    handleWriteUnlock(handle);
+                    handleUnlock(handle);
                     return(S_EVFILE_ALLOCFAIL);
                 }
             
@@ -4978,7 +5436,7 @@ if (debug) printf("INcreasing block size to %u words\n", (blockSize + EV_HDSIZ))
                 a->currentHeader = a->buf;
 
                 /* Initialize block header */
-                initLastBlockHeader(a->buf, 1);
+                initBlockHeader2(a->buf, 1);
                 
                 /* Remember size of new buffer */
                 a->bufRealSize = a->bufSize = (blockSize + EV_HDSIZ);
@@ -4987,10 +5445,9 @@ if (debug) printf("INcreasing block size to %u words\n", (blockSize + EV_HDSIZ))
                 /* Remember how much of buffer is actually being used */
                 a->bufSize = blockSize + EV_HDSIZ;
             }
-            else if (debug) {
-printf("DEcreasing block size to %u words\n", blockSize);
-            }
-                  
+
+if (debug) printf("evIoctl: block size = %u words\n", blockSize);
+
             /* Reset some file struct members */
 
             /* Recalculate how many words are left to write in block */
@@ -5010,7 +5467,7 @@ printf("DEcreasing block size to %u words\n", blockSize);
         case 'W':
             /* Need to specify buffer size */
             if (argp == NULL) {
-                handleWriteUnlock(handle);
+                handleUnlock(handle);
                 return(S_EVFILE_BADARG);
             }
 
@@ -5018,18 +5475,19 @@ printf("DEcreasing block size to %u words\n", blockSize);
             if (a->rw != EV_WRITEFILE &&
                 a->rw != EV_WRITEPIPE &&
                 a->rw != EV_WRITESOCK) {
-                handleWriteUnlock(handle);
+                handleUnlock(handle);
                 return(S_EVFILE_BADSIZEREQ);
             }
 
             /* If not appending AND events already written ... */
-            if (a->append == 0 && (a->blknum != 1 || a->blkEvCount != 0)) {
-                handleWriteUnlock(handle);
+            if (a->append == 0 && (a->blknum != 2 || a->blkEvCount != 0)) {
+if (debug) printf("evIoctl: error setting buffer size, not appending and events already written\n");
+                handleUnlock(handle);
                 return(S_EVFILE_BADSIZEREQ);
             }
             /* Else appending AND events already appended ... */
             else if (a->append > 1) {
-                handleWriteUnlock(handle);
+                handleUnlock(handle);
                 return(S_EVFILE_BADSIZEREQ);
             }
 
@@ -5038,19 +5496,21 @@ printf("DEcreasing block size to %u words\n", blockSize);
 
             /* If there is no change, return success */
             if (bufferSize == a->bufSize) {
-                handleWriteUnlock(handle);
+                handleUnlock(handle);
                 return(S_SUCCESS);
             }
 
             /* If it's too small, return error */
             if (bufferSize < a->blkSizeTarget + EV_HDSIZ) {
-                handleWriteUnlock(handle);
+if (debug) printf("evIoctl: error setting buffer size, too small, must be >= %u\n", (a->blkSizeTarget + EV_HDSIZ));
+                handleUnlock(handle);
                 return(S_EVFILE_BADSIZEREQ);
             }
 
             /* If it's too big, return error */
-            if (bufferSize > EV_BLOCKSIZE_MAX + EV_HDSIZ) {
-                handleWriteUnlock(handle);
+            if (bufferSize > EV_BLOCKSIZE_MAX) {
+if (debug) printf("evIoctl: error setting block target size, too large, must be <= %d\n", EV_BLOCKSIZE_MAX);
+                handleUnlock(handle);
                 return(S_EVFILE_BADSIZEREQ);
             }
 
@@ -5058,10 +5518,10 @@ printf("DEcreasing block size to %u words\n", blockSize);
             if (bufferSize > a->bufRealSize && a->rw != EV_WRITEBUF) {
                 /* Allocate buffer memory for increased size. If this fails
                  * we can still (theoretically) continue with writing. */
-if (debug) printf("INcreasing internal buffer size to %u words\n", bufferSize);
+if (debug) printf("evIoctl: increasing internal buffer size to %u words\n", bufferSize);
                 newBuf = (uint32_t *) malloc(bufferSize*4);
                 if (newBuf == NULL) {
-                    handleWriteUnlock(handle);
+                    handleUnlock(handle);
                     return(S_EVFILE_ALLOCFAIL);
                 }
 
@@ -5077,10 +5537,10 @@ if (debug) printf("INcreasing internal buffer size to %u words\n", bufferSize);
                 a->bufRealSize = bufferSize;
 
                 /* Initialize block header */
-                initLastBlockHeader(a->buf, 1);
+                initBlockHeader2(a->buf, 1);
             }
             else if (debug) {
-printf("DEcreasing internal buffer size to %u words\n", bufferSize);
+                printf("evIoctl: decreasing internal buffer size to %u words\n", bufferSize);
             }
             
             /* Reset some file struct members */
@@ -5103,7 +5563,7 @@ printf("DEcreasing internal buffer size to %u words\n", bufferSize);
         case 'V':
             /* Need to pass version back in pointer to int */
             if (argp == NULL) {
-                handleWriteUnlock(handle);
+                handleUnlock(handle);
                 return(S_EVFILE_BADARG);
             }
 
@@ -5118,19 +5578,30 @@ printf("DEcreasing internal buffer size to %u words\n", bufferSize);
         case 'H':
             /* Need to pass header data back in allocated int array */
             if (argp == NULL) {
-                handleWriteUnlock(handle);
+                handleUnlock(handle);
                 return(S_EVFILE_BADARG);
             }
-            
-            pHeader = (uint32_t *)malloc(EV_HDSIZ*sizeof(int));
+
+            pHeader = (uint32_t *)malloc(EV_HDSIZ*sizeof(uint32_t));
             if (pHeader == NULL) {
-                handleWriteUnlock(handle);
+                handleUnlock(handle);
                 return(S_EVFILE_ALLOCFAIL);
             }
-            
-            memcpy((void *)pHeader, (const void *)a->buf, EV_HDSIZ*sizeof(int));
+
+            /* If reading ... */
+            if (a->rw == EV_READFILE ||
+                a->rw == EV_READPIPE ||
+                a->rw == EV_READSOCK ||
+                a->rw == EV_READBUF) {
+                memcpy((void *)pHeader, (const void *)a->buf, EV_HDSIZ*sizeof(uint32_t));
+            }
+            else {
+                memcpy((void *) pHeader, (const void *) a->currentHeader, EV_HDSIZ * sizeof(uint32_t));
+            }
             *((uint32_t **) argp) = pHeader;
-            
+
+            printf("evIoctl: current block # = %u\n", a->blknum);
+
             break;
 
         /**********************************************/
@@ -5140,13 +5611,13 @@ printf("DEcreasing internal buffer size to %u words\n", bufferSize);
         case 'N':
             /* Need to specify # of events */
             if (argp == NULL) {
-                handleWriteUnlock(handle);
+                handleUnlock(handle);
                 return(S_EVFILE_BADARG);
             }
             
             eventsMax = *(uint32_t *) argp;
             if (eventsMax < 1) {
-                handleWriteUnlock(handle);
+                handleUnlock(handle);
                 return(S_EVFILE_BADSIZEREQ);
             }
 
@@ -5164,7 +5635,7 @@ printf("DEcreasing internal buffer size to %u words\n", bufferSize);
         case 'S':
             /* Need to specify split size */
             if (argp == NULL) {
-                handleWriteUnlock(handle);
+                handleUnlock(handle);
                 return(S_EVFILE_BADARG);
             }
             
@@ -5189,12 +5660,11 @@ printf("DEcreasing internal buffer size to %u words\n", bufferSize);
                 }
             }
 
-            /* Smallest possible evio format file = 18 32-bit ints.
-             * Must also be bigger than a single buffer. */
-            if (splitSize < 4*18 || splitSize < 4*a->bufSize) {
-if (debug) printf("evIoctl: split file size is too small! (%llu bytes), must be min %u\n",
-                  splitSize, 4*a->bufSize);
-                handleWriteUnlock(handle);
+            /* Smallest possible evio format file = 10 32-bit ints.
+             * Must also be bigger than a single buffer? */
+            if (splitSize < 4*10) {
+if (debug) printf("evIoctl: split file size is too small! (%llu bytes), must be min 40\n", splitSize);
+                handleUnlock(handle);
                 return(S_EVFILE_BADSIZEREQ);
             }
             
@@ -5209,16 +5679,16 @@ if (debug) printf("evIoctl: split file at %llu (0x%llx) bytes\n", splitSize, spl
         case 'R':
             /* Need to specify run # */
             if (argp == NULL) {
-                handleWriteUnlock(handle);
+                handleUnlock(handle);
                 return(S_EVFILE_BADARG);
             }
             
             runNumber = *(uint32_t *) argp;
             if (runNumber < 1) {
-                handleWriteUnlock(handle);
+                handleUnlock(handle);
                 return(S_EVFILE_BADSIZEREQ);
             }
-            
+
             a->runNumber = runNumber;
             break;
 
@@ -5234,12 +5704,75 @@ if (debug) printf("evIoctl: split file at %llu (0x%llx) bytes\n", splitSize, spl
             else {
                 runType = strdup((char *) argp);
                 if (runType == NULL) {
-                    handleWriteUnlock(handle);
+                    handleUnlock(handle);
                     return(S_EVFILE_BADSIZEREQ);
                 }
             }
             
             a->runType = runType;
+            break;
+
+        /************************************************/
+        /* Setting stream id for file naming            */
+        /************************************************/
+        case 'm':
+        case 'M':
+            /* Need to specify stream id */
+            if (argp == NULL) {
+                handleUnlock(handle);
+                return(S_EVFILE_BADARG);
+            }
+
+            a->streamId = *(uint32_t *) argp;
+            break;
+
+        /************************************************/
+        /* Turn mutex locking on/off                    */
+        /************************************************/
+        case 'x':
+        case 'X':
+            /* Need to specify stream id */
+            if (argp == NULL) {
+                handleUnlock(handle);
+                return(S_EVFILE_BADARG);
+            }
+            {
+                int lockingOn = *(uint32_t *) argp;
+                /* If we want to turn OFF locking ... */
+                if (lockingOn == 0) {
+                    /* Only do something if locking currently on */
+                    if (a->lockingOn != 0) {
+                        /* A bit tricky here. Since locking is on, a lock was grabbed in calling
+                         * this routine. So we need to release that lock - handleUnlock
+                         * is the only function that can do this - before we can exit
+                         * this routine. Then turn off locking. */
+                        handleUnlock(handle);
+                        /* Should do this while mutex is grabbed, but that's impossible here. */
+//printf("evIoctl: turn OFF locking\n");
+                        a->lockingOn = 0;
+                        return(S_SUCCESS);
+                    }
+//                    else {
+//                        printf("evIoctl: locking already OFF\n");
+//                    }
+                }
+                /* If we want to turn ON locking ... */
+                else {
+                    /* Only do something if locking currently off */
+                    if (a->lockingOn == 0) {
+                        /* A bit tricky here. Since locking is off, a lock was not grabbed in calling
+                         * this routine. So make sure that the lock is not released when exiting
+                         * this routine. Do this by turning locking on but exiting without calling
+                         * handleUnlock. */
+//printf("evIoctl: turn ON locking\n");
+                        a->lockingOn = 1;
+                        return(S_SUCCESS);
+                    }
+//                    else {
+//                        printf("evIoctl: locking already ON\n");
+//                    }
+                }
+            }
             break;
 
         /****************************/
@@ -5249,24 +5782,24 @@ if (debug) printf("evIoctl: split file at %llu (0x%llx) bytes\n", splitSize, spl
         case 'E':
             /* Need to pass # of events bank in pointer to int */
             if (argp == NULL) {
-                handleWriteUnlock(handle);
+                handleUnlock(handle);
                 return(S_EVFILE_BADARG);
             }
 
             err = getEventCount(a, (uint32_t *) argp);
             if (err != S_SUCCESS) {
-                handleWriteUnlock(handle);
+                handleUnlock(handle);
                 return(err);
             }
 
             break;
 
         default:
-            handleWriteUnlock(handle);
+            handleUnlock(handle);
             return(S_EVFILE_UNKOPTION);
     }
 
-    handleWriteUnlock(handle);
+    handleUnlock(handle);
 
     return(S_SUCCESS);
 }
@@ -5297,33 +5830,34 @@ int evGetRandomAccessTable(int handle, uint32_t *** const table, uint32_t *len) 
     if (handle < 1 || handle > handleCount) {
         return(S_EVFILE_BADHANDLE);
     }
-    /* Don't allow simultaneous calls to evClose(), but do allow reads & writes. */
-    handleReadLock(handle);
+
+    /* For thread-safe function calls */
+    handleLock(handle);
 
     /* Look up file struct from handle */
     a = handleList[handle-1];
 
     /* Check args */
     if (a == NULL) {
-        handleReadUnlock(handle);
+        handleUnlock(handle);
         return(S_EVFILE_BADHANDLE);
     }
 
     if (table == NULL || len == NULL) {
-        handleReadUnlock(handle);
+        handleUnlock(handle);
         return (S_EVFILE_BADARG);
     }
 
     /* Must be in random access mode */
     if (!a->randomAccess) {
-        handleReadUnlock(handle);
+        handleUnlock(handle);
         return(S_EVFILE_BADMODE);
     }
             
     *table = a->pTable;
     *len = a->eventCount;
 
-    handleReadUnlock(handle);
+    handleUnlock(handle);
 
     return S_SUCCESS;
 }
@@ -5341,7 +5875,7 @@ int evGetRandomAccessTable(int handle, uint32_t *** const table, uint32_t *len) 
  *                   Memory for dictionary allocated here, must be freed by
  *                   caller.
  * @param len        pointer to int which gets filled with dictionary
- *                   string length if there is one, else filled with 0.
+ *                   string length (# chars) if there is one, else filled with 0.
  *                   If this arg = NULL, no len is returned.
  *
  * @return S_SUCCESS           if successful
@@ -5357,40 +5891,37 @@ int evGetDictionary(int handle, char **dictionary, uint32_t *len) {
     if (handle < 1 || handle > handleCount) {
         return(S_EVFILE_BADHANDLE);
     }
-    /* Don't allow simultaneous calls to evClose(), but do allow reads & writes. */
-    handleReadLock(handle);
+
+    /* For thread-safe function calls */
+    handleLock(handle);
 
     /* Look up file struct from handle */
     a = handleList[handle-1];
 
     /* Check args */
     if (a == NULL) {
-        handleReadUnlock(handle);
+        handleUnlock(handle);
         return(S_EVFILE_BADHANDLE);
     }
 
     if (dictionary == NULL) {
-        handleReadUnlock(handle);
+        handleUnlock(handle);
         return (S_EVFILE_BADARG);
     }
-
-    /* Lock mutex for multithreaded reads/writes/access */
-    mutexLock(a);
 
     /* If we have a dictionary ... */
     if (a->dictionary != NULL) {
         /* Copy it and return it */
         dictCpy = strdup(a->dictionary);
         if (dictCpy == NULL) {
-            mutexUnlock(a);
-            handleReadUnlock(handle);
+            handleUnlock(handle);
             return(S_EVFILE_ALLOCFAIL);
         }
         *dictionary = dictCpy;
 
         /* Send back the length if caller wants it */
         if (len != NULL) {
-            *len = strlen(a->dictionary);
+            *len = (uint32_t ) strlen(a->dictionary);
         }
     }
     else {
@@ -5400,11 +5931,19 @@ int evGetDictionary(int handle, char **dictionary, uint32_t *len) {
         }
     }
     
-    mutexUnlock(a);
-    handleReadUnlock(handle);
+    handleUnlock(handle);
 
     return S_SUCCESS;
 }
+
+
+/** @} */
+
+
+/**
+ * @addtogroup write
+ * @{
+ */
 
 
 /**
@@ -5430,50 +5969,48 @@ int evWriteDictionary(int handle, char *xmlDictionary)
     EVFILE   *a;
     char     *pChar;
     uint32_t *dictBuf;
-    int       i, status, dictionaryLen, padSize, bufSize, pads[] = {4,3,2,1};
+    size_t    dictionaryLen, bufSize;
+    int       i, status, padSize, pads[] = {4,3,2,1};
 
     
     if (handle < 1 || handle > handleCount) {
         return(S_EVFILE_BADHANDLE);
     }
-    /* Don't allow simultaneous calls to evClose(), but do allow reads & writes. */
-    handleReadLock(handle);
+
+    /* For thread-safe function calls */
+    handleLock(handle);
 
     /* Look up file struct from handle */
     a = handleList[handle-1];
 
     /* Check args */
     if (a == NULL) {
-        handleReadUnlock(handle);
+        handleUnlock(handle);
         return(S_EVFILE_BADHANDLE);
     }
     
     /* Minimum length of dictionary xml to be in proper format is 35 chars. */
     if (strlen(xmlDictionary) < 35) {
-        handleReadUnlock(handle);
+        handleUnlock(handle);
         return(S_EVFILE_BADARG);
     }
             
     /* Need to be writing not reading */
     if (a->rw != EV_WRITEFILE && a->rw != EV_WRITEPIPE &&
         a->rw != EV_WRITEBUF  && a->rw != EV_WRITESOCK) {
-        handleReadUnlock(handle);
+        handleUnlock(handle);
         return(S_EVFILE_BADMODE);
     }
     
     /* Cannot be appending */
     if (a->append) {
-        handleReadUnlock(handle);
+        handleUnlock(handle);
         return(S_EVFILE_BADMODE);
     }
 
-    /* Lock mutex for multithreaded reads/writes/access */
-    mutexLock(a);
-
     /* Cannot have already written dictionary or a single event */
-    if (a->blknum != 1 || a->eventCount > 0 || a->wroteDictionary) {
-        mutexUnlock(a);
-        handleReadUnlock(handle);
+    if (a->blknum != 2 || a->eventCount > 0 || a->wroteDictionary) {
+        handleUnlock(handle);
         return(S_FAILURE);
     }
 
@@ -5485,8 +6022,7 @@ int evWriteDictionary(int handle, char *xmlDictionary)
     /* Store dictionary */
     a->dictionary = strdup(xmlDictionary);
     if (a->dictionary == NULL) {
-        mutexUnlock(a);
-        handleReadUnlock(handle);
+        handleUnlock(handle);
         return(S_EVFILE_ALLOCFAIL);
     }
     dictionaryLen = strlen(xmlDictionary);
@@ -5506,13 +6042,12 @@ int evWriteDictionary(int handle, char *xmlDictionary)
     dictBuf = (uint32_t *) malloc(bufSize);
     if (dictBuf == NULL) {
         free(a->dictionary);
-        mutexUnlock(a);
-        handleReadUnlock(handle);
+        handleUnlock(handle);
         return(S_EVFILE_ALLOCFAIL);
     }
 
     /* Write bank length (in 32 bit ints) */
-    dictBuf[0] = bufSize/4 - 1;
+    dictBuf[0] = (uint32_t)bufSize/4 - 1;
     /* Write tag(0), type(8 bit char *), & num(0) (strings are self-padding) */
     dictBuf[1] = 0x3 << 8;
     /* Write chars */
@@ -5530,17 +6065,496 @@ int evWriteDictionary(int handle, char *xmlDictionary)
 
     /* Store bank containing dictionary and its length (bytes) */
     a->dictBuf = dictBuf;
-    a->dictLength = bufSize;
+    a->dictLength = (uint32_t)bufSize;
 
     /* Write dictionary */
-    status = evWriteDictImpl(a, dictBuf);
+    status = evWriteDictImpl(a);
 
-    mutexUnlock(a);
-    handleReadUnlock(handle);
+    handleUnlock(handle);
 
     return status;
 }
 
+
+/**
+ * This routine writes an optional "first event" after any dictionary in
+ * an evio file/socket/buffer. This is only useful when writing files however.
+ * In that case all split files also have the first event written immediately
+ * after any dictionary. If writing to a buffer or socket, one could just as
+ * easily write the first event in the normal way.
+ *
+ * @param handle      evio handle
+ * @param firstEvent  buffer containing first event,
+ *                    or NULL to remove previously specified first event
+ *
+ * @return S_SUCCESS           if successful
+ * @return S_EVFILE_BADMODE    if reading or appending
+ * @return S_EVFILE_ALLOCFAIL  if cannot allocate memory
+ * @return S_EVFILE_BADHANDLE  if bad handle arg
+ * @return errno               if file/socket write error
+ * @return stream error        if file stream error
+ */
+int evWriteFirstEvent(int handle, const uint32_t *firstEvent)
+{
+    EVFILE   *a;
+    int       status;
+    uint32_t  bytesToWrite;
+
+    if (handle < 1 || handle > handleCount) {
+        return(S_EVFILE_BADHANDLE);
+    }
+
+    /* For thread-safe function calls */
+    handleLock(handle);
+
+    /* Look up file struct from handle */
+    a = handleList[handle-1];
+
+    /* Check args */
+    if (a == NULL) {
+        handleUnlock(handle);
+        return(S_EVFILE_BADHANDLE);
+    }
+
+    /* Need to be writing not reading */
+    if (a->rw != EV_WRITEFILE && a->rw != EV_WRITEPIPE &&
+        a->rw != EV_WRITEBUF  && a->rw != EV_WRITESOCK) {
+        handleUnlock(handle);
+        return(S_EVFILE_BADMODE);
+    }
+
+    /* Clear any previously specified first event */
+    if (a->firstEventBuf != NULL) {
+        free(a->firstEventBuf);
+    }
+
+    /* Clear first event */
+    if (firstEvent == NULL) {
+        a->firstEventBuf = NULL;
+        a->firstEventLength = 0;
+
+        if (a->dictionary != NULL) {
+            a->commonBlkCount = 1;
+        }
+        else {
+            a->commonBlkCount = 0;
+        }
+
+        handleUnlock(handle);
+        return(S_SUCCESS);
+    }
+
+    /* Find the first event's bytes and the memory size needed
+     * to contain the common events (dictionary + first event). */
+    if (a->dictionary != NULL) {
+        a->commonBlkCount = 1;
+    }
+    else {
+        a->commonBlkCount = 0;
+    }
+
+    /* Number of bytes to write = full event size + bank header */
+    bytesToWrite = 4*(firstEvent[0] + 1);
+
+    /* Store first event */
+    a->firstEventBuf = (uint32_t *) calloc(1, bytesToWrite);
+    a->firstEventLength = bytesToWrite;
+    if (a->firstEventBuf == NULL) {
+        handleUnlock(handle);
+        return(S_EVFILE_ALLOCFAIL);
+    }
+    memcpy(a->firstEventBuf, firstEvent, bytesToWrite);
+
+    /* Write first event, without grabbing mutex, is not a dictionary */
+    status = evWriteImpl(handle, firstEvent, 0);
+
+    /* First event defined and written. From here on common block will increase by 1. */
+    a->commonBlkCount++;
+
+    handleUnlock(handle);
+
+    return status;
+}
+
+
+/**
+ * This routine takes the given "first event" (evio bank) and places it into a properly
+ * formatted evio block (evio file format) with the proper bit set in the block
+ * header labeling content as a first event. The returned buffer has been
+ * malloced and needs to be freed by the caller.<p>
+ * The localEndian arg tells this routine the endianness of the data in the
+ * firstEvent buffer. No swapping is done in this routine.
+ *
+ * @param firstEvent  pointer to evio bank defining the first event
+ * @param localEndian true (not 0) if first event and containing block
+ *                    are same as local endian, else false (0)
+ * @param block       pointer which gets set to malloced block
+ * @param words       int pointer which gets filled with length of
+ *                    returned data in 32-bit words
+ *
+ * @return S_SUCCESS           if successful
+ * @return S_EVFILE_BADARG     if firstEvent, block, or words args are NULL
+ * @return S_EVFILE_ALLOCFAIL  if cannot allocate memory
+ */
+int evCreateFirstEventBlock(const uint32_t *firstEvent, int localEndian, void **block, uint32_t *words) {
+
+    int      i;
+    uint32_t blockWords, *mem;
+
+    /* Check arg */
+    if (firstEvent == NULL || block == NULL || words == NULL) {
+        return(S_EVFILE_BADARG);
+    }
+
+    if (localEndian) {
+        blockWords = firstEvent[0] + 1 + 8;
+    }
+    else {
+        blockWords = EVIO_SWAP32(firstEvent[0]) + 1 + 8;
+    }
+
+    mem = (uint32_t *) calloc(1, 4*blockWords);
+    if (mem == NULL) {
+        return(S_EVFILE_ALLOCFAIL);
+    }
+
+    /* Create the block header */
+
+    /* Total block len inclusive in 32-bit words */
+    mem[0] = blockWords;
+    /* Block # starts at 1 */
+    mem[1] = 1;
+    /* Words in header */
+    mem[2] = 8;
+    /* Events in block */
+    mem[3] = 1;
+    /* Reserved */
+    mem[4] = 0;
+    /* Bit info word: version in lowest byte, is last block, & contains first event. */
+    mem[5] = (EV_VERSION & 0xff) | EV_LASTBLOCK_MASK | EV_FIRSTEVENT_MASK;
+    /* Reserved */
+    mem[6] = 0;
+    /* Magic int */
+    mem[7] = 0xc0da0100;
+
+    /* Get the endian right */
+    if (!localEndian) {
+        for (i=0; i < 8; i++) mem[i] = EVIO_SWAP32(mem[i]);
+    }
+
+    /* Copy in the event */
+    memcpy((void *)(mem+8), (const void *)firstEvent, 4*blockWords);
+
+    /* Return to caller */
+    *block = (void *)mem;
+    *words = blockWords;
+
+    return(S_SUCCESS);
+}
+
+
+/**
+ * This routine writes an array of strings, in evio format, into the given buffer.
+ * This does NOT include any bank, segment, or tagsegment header.
+ * The length of the written data in bytes is returned in the "dataLen" arg.
+ * The written data is endian independent.
+ *
+ * @param buffer      buffer in which to place the evio format string data
+ * @param bufLen      length of available room in which to write data in buffer in bytes
+ * @param strings     array of strings to write as data
+ * @param stringCount number of strings in string array
+ * @param dataLen     pointer to int which gets filled the length of the written data in bytes
+ *
+ * @return S_SUCCESS          if successful
+ * @return S_EVFILE_BADARG    if buffer or dataLen arg is NULL, bufLen < 4, stringCount < 0,
+ *                            or a string is NULL
+ * @return S_EVFILE_TRUNC     if not enough room in buffer
+ */
+int evStringsToBuf(uint32_t *buffer, int bufLen, char **strings, int stringCount, int *dataLen) {
+
+    size_t len;
+    char *buf = (char *) buffer;
+    int i, size=0, padChars, pads[4] = {4,3,2,1};
+
+    if (buffer == NULL || dataLen == NULL || bufLen < 4 || stringCount < 0) {
+        return(S_EVFILE_BADARG);
+    }
+
+    if (strings == NULL || stringCount == 0) {
+        return(S_SUCCESS);
+    }
+
+    /* Find out how much space we need. */
+    for (i=0; i < stringCount; i++) {
+        if (strings[i] == NULL) {
+            return(S_EVFILE_BADARG);
+        }
+        size += strlen(strings[i]) + 1;
+    }
+    padChars = pads[size%4];
+    size += padChars;
+
+    if (size > bufLen) {
+        return(S_EVFILE_TRUNC);
+    }
+
+    for (i=0; i < stringCount; i++) {
+        len = strlen(strings[i]);
+        memcpy((void *)buf, (const void *)strings[i], len);
+        buf[len] = '\0';
+        buf += len + 1;
+    }
+
+    /* Add any necessary padding to 4 byte boundaries.
+       IMPORTANT: There must be at least one '\004'
+       character at the end. This distinguishes evio
+       string array version from earlier version. */
+    /*fprintf(stderr,"evGetNewBuffer: read %d bytes from file\n", (int)bytesToRead);*/
+    for (i=0; i < padChars; i++) {
+        buf[i]='\4';
+    }
+
+    *dataLen = size;
+
+    return(S_SUCCESS);
+}
+
+
+/** @} */
+
+
+
+/**
+ * @addtogroup read
+ * @{
+ */
+
+
+/**
+ * This routine adds a string to an array of strings.
+ * If no array has been allocated, it's created.
+ * If the existing array is too small, its size is doubled and the pointer is updated.
+ * Existing strings are moved into the newly created array.<p>
+ *
+ * Array pointed to in pArray needs to be freed by the caller.
+ * All strings contained in the array also need to be freed by the caller.
+ *
+ * @param pArray          address of array of strings
+ *                        (array will be changed if more space was needed).
+ * @param str             string to add to array
+ * @param pTotalCount     address of total number of array elements
+ *                        (number of elements will be changed if more space was needed)
+ * @param pvalidStrCount  address of number of array elements with valid strings
+ *                        (number will increase by one if no error)
+ */
+static int addStringToArray(char ***pArray, char *str, int *pTotalCount, int *pvalidStrCount) {
+
+    int i, doubleLen;
+    int totCount = *pTotalCount;
+    int strCount = *pvalidStrCount;
+    char **doubleArray, **oldArray = *pArray;
+
+    if (str == NULL) {
+        return(S_EVFILE_BADARG);
+    }
+
+    /* If first time a string's been added, start with space for 100 strings. */
+    if (oldArray == NULL) {
+        oldArray = (char **)calloc(1, 100*sizeof(char *));
+        if (oldArray == NULL) {
+            return(S_EVFILE_ALLOCFAIL);
+        }
+        *pArray = oldArray;
+        *pTotalCount = 100;
+        strCount = 0;
+        totCount = 100;
+    }
+
+    /* If we don't need more space, place string in existing array and return */
+    if (strCount < totCount) {
+        str = strdup(str);
+        if (str == NULL) {
+            return(S_EVFILE_ALLOCFAIL);
+        }
+        oldArray[strCount] = str;
+        *pvalidStrCount = strCount + 1;
+        return(S_SUCCESS);
+    }
+
+    /* If here, we need more space so double capacity */
+    doubleLen = 2 * strCount;
+    doubleArray = (char **)calloc(1, doubleLen*sizeof(char *));
+    if (doubleArray == NULL) {
+        return(S_EVFILE_ALLOCFAIL);
+    }
+
+    /* Copy over all existing strings into new, larger array */
+    for (i=0; i < strCount; i++) {
+        doubleArray[i] = oldArray[i];
+    }
+
+    /* Add string */
+    str = strdup(str);
+    if (str == NULL) {
+        return(S_EVFILE_ALLOCFAIL);
+    }
+    doubleArray[strCount] = str;
+
+    free(oldArray);
+    *pArray = doubleArray;
+    *pTotalCount = doubleLen;
+    *pvalidStrCount = strCount + 1;
+
+    return(S_SUCCESS);
+}
+
+
+/**
+ * This routine unpacks/parses an evio format buffer containing strings
+ * into an array of strings. Evio string data is endian independent.
+ * The array pointed to in pStrArray is allocated here and needs to be freed by the caller.
+ * All strings contained in the array also need to be freed by the caller.
+ *
+ * @param buffer      buffer containing evio format string data (NOT including header)
+ * @param bufLen      length of string data in bytes
+ * @param pStrArray   address of string array which gets filled parsed strings
+ * @param strCount    pointer to int which get filled with the number of strings in string array
+ *
+ * @return S_SUCCESS          if successful
+ * @return S_EVFILE_BADARG    if buffer, pStrArray, or strCount arg is NULL, or if bufLen < 4.
+ * @return S_EVFILE_TRUNC     if not enough room in buffer
+ * @return S_FAILURE          if buffer not in proper evio format
+ */
+int evBufToStrings(char *buffer, int bufLen, char ***pStrArray, int *strCount) {
+
+    int i, j, totalCount, stringCount;
+    int badStringFormat = 1, nullCount = 0, noEnding4 = 0;
+    char c, *strStart = buffer, *pChar = buffer;
+    char **strArray = NULL;
+
+    if (buffer == NULL    || bufLen < 4 ||
+        pStrArray == NULL || strCount == NULL) {
+        return(S_EVFILE_BADARG);
+    }
+
+    /*
+       Each string is terminated with a null (char val = 0)
+       and in addition, the end is padded by ASCII 4's (char val = 4).
+       However, in the legacy versions of evio, there is only one
+       null-terminated string and anything as padding. To accommodate legacy evio, if
+       there is not an ending ASCII value 4, anything past the first null is ignored.
+       After doing so, split at the nulls.
+     */
+
+    if (buffer[bufLen - 1] != '\4') {
+        noEnding4 = 1;
+    }
+
+    for (i=0; i < bufLen; i++) {
+        /* look at each character */
+        c = *pChar++;
+
+        /* If char is a NULL */
+        if (c == '\0') {
+            /* One string for each NULL */
+            nullCount++;
+
+            /* String starts where we started looking from, strStart, and ends at this NULL */
+            addStringToArray(&strArray, strStart, &totalCount, &stringCount);
+/*printf("  add %s\n", strStart);*/
+
+            /* Start looking for next string right after this NULL */
+            strStart = pChar;
+
+            /* If evio v1, 2 or 3, only 1 null terminated string exists
+               and padding is just junk or nonexistent. */
+            if (noEnding4) {
+                badStringFormat = 0;
+                break;
+            }
+        }
+        /* Look for any non-printing/control characters (not including NULL)
+           and end the string there. Allow tab and newline whitespace. */
+        else if ((c < 32 || c > 126) && c != 9 && c != 10) {
+/*printf("unpackRawBytesToStrings: found non-printing char = 0x%x at i = %d\n", c, i);*/
+            if (nullCount < 1) {
+                /* Getting garbage before first NULL */
+/*printf("BAD FORMAT 1, no null when garbage char found\n");*/
+                break;
+            }
+
+            /* Already have at least one NULL & therefore a String.
+               Now we have junk or non-printing ascii which is
+               possibly the ending 4. */
+
+            /* If we have a 4, investigate further to see if format
+               is entirely valid. */
+            if (c == '\4') {
+                /* How many more chars are there? */
+                int charsLeft = bufLen - (i+1);
+
+                /* Should be no more than 3 additional 4's before the end */
+                if (charsLeft > 3) {
+/*printf("BAD FORMAT 2, too many chars, %d, after 4\n", charsLeft);*/
+                    break;
+                }
+                else {
+                    int error = 0;
+                    /* Check to see if remaining chars are all 4's. If not, bad. */
+                    for (j=1; j <= charsLeft; j++) {
+                        c = buffer[i+j];
+                        if (c != '\004') {
+/*printf("BAD FORMAT 3, padding chars are NOT all 4's\n");*/
+                            error = 1;
+                            break;
+                        }
+                    }
+                    if (error) break;
+                    badStringFormat = 0;
+                    break;
+                }
+            }
+            else {
+/*printf("BAD FORMAT 4, got bad char, ascii val = %d\n", c);*/
+                break;
+            }
+        }
+    }
+
+    /* If the format is bad, free any allocated memory and return an error. */
+    if (badStringFormat) {
+        /* Have we allocated anything yet? If so, get rid of it since
+              we ran into a badly formatted  part of the buffer. */
+        if (nullCount > 0) {
+            /* Free strings */
+            for (i=0; i < nullCount; i++) {
+                free(strArray[i]);
+            }
+            /* Free array */
+            free(strArray);
+        }
+
+        *strCount = 0;
+        *pStrArray = NULL;
+        return(S_FAILURE);
+    }
+
+    *strCount  = nullCount;
+    *pStrArray = strArray;
+
+/*printf("  split into %d strings\n", nullCount);*/
+    return(S_SUCCESS);
+}
+
+
+/** @} */
+
+
+
+/**
+ * @addtogroup getAndSet
+ * @{
+ */
 
 /**
  * This routine returns a string representation of an evio type.
@@ -5629,7 +6643,7 @@ const char *evGetTypename(int type) {
 /**
  * This routine return true (1) if given type is a container, else returns false (0).
  *
- * @param type numerical value of an evio type
+ * @param type numerical value of an evio type (eg. type = 0x10 = bank, returns 1)
  * @return 1 if given type is a container, else 0.
  */
 int evIsContainer(int type) {
@@ -5725,5 +6739,6 @@ char *evPerror(int error) {
 }
 
 
+/** @} */
 
 

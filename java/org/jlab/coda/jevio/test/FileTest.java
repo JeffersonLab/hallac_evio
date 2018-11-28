@@ -17,132 +17,11 @@ import java.util.List;
 public class FileTest {
 
 
-
-    /** For testing the speed difference in writeEvent algorithms.
-     *  Want about 1000 little events/block.  */
-    public static void main11(String args[]) {
-
-        // Create an event writer to write out the test events.
-        String fileName  = "/daqfs/home/timmer/coda/jevio-4.3/testdata/speedTest.ev";
-        File file = new File(fileName);
-
-        // data
-        byte[] byteData1 = new byte[499990];
-
-        int num, count = 0;
-        long t1=0, t2=0, time, totalT=0, totalCount=0;
-        double rate, avgRate;
-
-        try {
-            // 1MB max block size, 2 max # events/block
-            EventWriter eventWriter = new EventWriter(file, 1000000, 2,
-                                                      ByteOrder.BIG_ENDIAN, null, null);
-
-            // event -> bank of bytes
-            // each event (including header) is 100 bytes
-            EventBuilder eventBuilder = new EventBuilder(1, DataType.CHAR8, 1);
-            EvioEvent ev = eventBuilder.getEvent();
-            ev.appendByteData(byteData1);
-
-            // keep track of time
-            t1 = System.currentTimeMillis();
-
-
-            for (int j=0; j < 10; j++) {
-// 10 MB file with 10 block headers
-                for (int i=0; i < 2; i++) {
-                    eventWriter.writeEvent(ev);
-                    count++;
-                }
-            }
-
-            // all done writing
-            eventWriter.close();
-
-            // calculate the event rate
-            t2 = System.currentTimeMillis();
-            time = t2 - t1;
-            rate = 1000.0 * ((double) count) / time;
-            totalCount += count;
-            totalT += time;
-            avgRate = 1000.0 * ((double) totalCount) / totalT;
-            System.out.println("rate = " + String.format("%.3g", rate) +
-                                       " Hz,  avg = " + String.format("%.3g", avgRate));
-            System.out.println("time = " + (time) + " milliseconds");
-            count = 0;
-            t1 = System.currentTimeMillis();
-        }
-        catch (IOException e) {
-            e.printStackTrace();
-        }
-        catch (EvioException e) {
-            e.printStackTrace();
-        }
-
-
-    }
-
-
-
     /** For WRITING a local file. */
     public static void main(String args[]) {
 
-        String fileName  = "/daqfs/home/timmer/coda/jevio-4.3/testdata/fileTestSmall.ev";
-        File file = new File(fileName);
-
-        String xmlDictionary = null;
-
-        // data
-        int[]   intData  = new int[]   {0,1,2,3,4,5,6,7,8,9,10,11,12,13};
-
-        // Do we overwrite or append?
-        boolean append = false;
-
-        // Do we write to file or buffer?
-        boolean useFile = true;
-
-        // Top level event
-        EvioEvent event = null;
-
-        try {
-            // Create an event writer to write out the test events to file
-            EventWriter writer = new EventWriter(file, xmlDictionary, append);
-
-
-            // Build event (bank of banks) with EventBuilder object
-            EventBuilder builder = new EventBuilder(1, DataType.BANK, 1);
-            event = builder.getEvent();
-
-            // bank of int
-            EvioBank bankInts = new EvioBank(2, DataType.INT32, 2);
-            bankInts.appendIntData(intData);
-            builder.addChild(event, bankInts);
-
-
-            for (int i=0; i < 1; i++) {
-                // Write event to file
-                writer.writeEvent(event);
-            }
-
-            // All done writing
-            writer.close();
-        }
-        catch (IOException e) {
-            e.printStackTrace();
-        }
-        catch (EvioException e) {
-            e.printStackTrace();
-        }
-
-    }
-
-
-
-    /** For WRITING a local file. */
-    public static void mainww(String args[]) {
-
         // String fileName  = "./myData.ev";
-        String fileName  = "/daqfs/home/timmer/coda/jevio-4.3/testdata/fileTestSmall.ev";
+        String fileName  = "/home/timmer/fileTestSmall.ev";
         File file = new File(fileName);
         ByteBuffer myBuf = null;
 
@@ -150,23 +29,30 @@ public class FileTest {
         String xmlDictionary =
             "<xmlDict>\n" +
             "  <bank name=\"My Event\"       tag=\"1\"   num=\"1\">\n" +
-            "     <bank name=\"Segments\"    tag=\"2\"   num=\"2\">\n" +
+            "     <bank name=\"Ints\"    tag=\"2\"   num=\"2\">\n" +
             "       <leaf name=\"My Shorts\" tag=\"3\"   />\n" +
             "     </bank>\n" +
-            "     <bank name=\"Banks\"       tag=\"1\"   num=\"1\">\n" +
+            "     <bank name=\"Banks\"       tag=\"4\"   num=\"4\">\n" +
             "       <leaf name=\"My chars\"  tag=\"5\"   num=\"5\"/>\n" +
             "     </bank>\n" +
             "  </bank>\n" +
-            "  <dictEntry name=\"Last Bank\" tag=\"33\"  num=\"66\"/>\n" +
+            "  <dictEntry name=\"First Event\" tag=\"100\"  num=\"100\"/>\n" +
             "  <dictEntry name=\"Test Bank\" tag=\"1\" />\n" +
             "</xmlDict>";
-        xmlDictionary = null;
+        //xmlDictionary = null;
         // data
         byte[]  byteData1 = new byte[]  {1,2,3,4,5};
-        int[]   intData1  = new int[]   {4,5,6};
+        int[]   intData1  = new int[]   {1,2,3,4};
+        //final int bigSize =  549990;
+        //int[]   bigIntData  = new int[bigSize];
         int[]   intData2  = new int[]   {7,8,9};
         short[] shortData = new short[] {11,22,33};
         double[] doubleData = new double[] {1.1,2.2,3.3};
+
+
+//        for (int i=0; i < bigSize; i++) {
+//            bigIntData[i] = i;
+//        }
 
         // Do we overwrite or append?
         boolean append = false;
@@ -181,85 +67,99 @@ public class FileTest {
             // Create an event writer to write out the test events to file
             EventWriter writer;
 
+//            // Build event (bank of banks) with EventBuilder object
+//            EventBuilder builder = new EventBuilder(1, DataType.BANK, 1);
+//            event = builder.getEvent();
+//
+//            // bank of ints
+//            EvioBank bankInts = new EvioBank(2, DataType.INT32, 2);
+//            bankInts.appendIntData(intData1);
+//            builder.addChild(event, bankInts);
+
+            // Build event (bank of ints) with EventBuilder object
+            EventBuilder builder = new EventBuilder(1, DataType.INT32, 1);
+            event = builder.getEvent();
+            event.appendIntData(intData1);
+
+
+            // Build first event
+            EventBuilder builder3 = new EventBuilder(100, DataType.INT32, 100);
+            EvioEvent eventFirst = builder3.getEvent();
+
+            // bank of ints
+            int[] intFirstData = new int[6];
+            for (int i=0; i < intFirstData.length; i++) {
+                intFirstData[i] = 0x100*(i+1);
+            }
+            eventFirst.appendIntData(intFirstData);
+
+
+
             if (useFile) {
-                writer = new EventWriter(file, xmlDictionary, append);
+//                writer = new EventWriter(file, 16, 1000, ByteOrder.nativeOrder(),
+//                                         xmlDictionary, null, true, append);
+
+// Include first event
+                int splitBytes = 160;
+                int targetBlockSize = 29;
+                int internalBufSize = 148;
+                writer = new EventWriter(file.getPath(), null, null, 0, splitBytes,
+                                         targetBlockSize, 1000, internalBufSize,
+                                         ByteOrder.nativeOrder(), xmlDictionary,
+                                         null, true, append, eventFirst);
             }
             else {
                 // Create an event writer to write to buffer
                 myBuf = ByteBuffer.allocate(10000);
-                myBuf.order(ByteOrder.LITTLE_ENDIAN);
-                writer = new EventWriter(myBuf, xmlDictionary, append);
+                //myBuf.order(ByteOrder.LITTLE_ENDIAN);
+                //writer = new EventWriter(myBuf, xmlDictionary, append);
+                writer = new EventWriter(myBuf, 28, 1000, null, null, 0, 1, append, null);
             }
 
-//            // Build event (bank of banks) without an EventBuilder
-//            event = new EvioEvent(1, DataType.BANK, 1);
+
+//            // Build bigger event
+//            EventBuilder builder2 = new EventBuilder(10, DataType.BANK, 10);
+//            EvioEvent event2 = builder2.getEvent();
 //
-//            // bank of segments
-//            EvioBank bankSegs = new EvioBank(2, DataType.SEGMENT, 2);
-//            event.insert(bankSegs);
+//            // bank of int
+//            int[] intData = new int[5];
+//            for (int i=0; i < intData.length; i++) {
+//                intData[i] = i;
+//            }
+//            EvioBank bankInts2 = new EvioBank(20, DataType.INT32, 20);
+//            bankInts2.appendIntData(intData);
+//            builder2.addChild(event2, bankInts2);
+
+            // Build bigger event
+            EventBuilder builder2 = new EventBuilder(10, DataType.INT32, 10);
+            EvioEvent event2 = builder2.getEvent();
+
+            // bank of int
+            int[] intData = new int[5];
+            for (int i=0; i < intData.length; i++) {
+                intData[i] = 2*i;
+            }
+            event2.appendIntData(intData);
+
+
+
+//            // Write event to file
+//            writer.writeEvent(event);
+//            System.out.println("Event #1, Block #" + writer.getBlockNumber());
 //
-//            // segment of 3 shorts
-//            EvioSegment segShorts = new EvioSegment(3, DataType.SHORT16);
-//            segShorts.setShortData(shortData);
-//            bankSegs.insert(segShorts);
-//            bankSegs.remove(segShorts);
+//            writer.writeEvent(event2);
+//            System.out.println("Event #2, Block #" + writer.getBlockNumber());
 //
-//            // another bank of banks
-//            EvioBank bankBanks = new EvioBank(4, DataType.BANK, 4);
-//            event.insert(bankBanks);
-//
-//            // bank of chars
-//            EvioBank charBank = new EvioBank(5, DataType.CHAR8, 5);
-//            charBank.setByteData(byteData1);
-//            bankBanks.insert(charBank);
-//
-//            event.setAllHeaderLengths();
+//            writer.writeEvent(event);
+//            System.out.println("Event #3, Block #" + writer.getBlockNumber());
 
-            // Build event (bank of banks) with EventBuilder object
-            EventBuilder builder = new EventBuilder(1, DataType.BANK, 1);
-            event = builder.getEvent();
 
-            // bank of doubles
-            EvioBank bankDoubles = new EvioBank(1, DataType.DOUBLE64, 2);
-            bankDoubles.appendDoubleData(doubleData);
-            builder.addChild(event, bankDoubles);
 
-            // bank of segments
-            EvioBank bankSegs = new EvioBank(2, DataType.SEGMENT, 2);
-            builder.addChild(event, bankSegs);
-
-            // segment of 3 shorts
-            EvioSegment segShorts = new EvioSegment(3, DataType.SHORT16);
-            segShorts.appendShortData(shortData);
-            builder.addChild(bankSegs, segShorts);
-            //builder.remove(segShorts);
-
-            // another bank of banks
-            EvioBank bankBanks = new EvioBank(4, DataType.BANK, 4);
-            builder.addChild(event, bankBanks);
-
-            // bank of chars
-            EvioBank charBank = new EvioBank(5, DataType.CHAR8, 5);
-            charBank.appendByteData(byteData1);
-            builder.addChild(bankBanks, charBank);
-
-            // event - ban
-            // of banks
-            EvioEvent lastEvent = new EvioEvent(33, DataType.INT32, 66);
-            // Call this BEFORE appending data!
-            lastEvent.setByteOrder(ByteOrder.LITTLE_ENDIAN);
-            lastEvent.appendIntData(intData1);
-            lastEvent.setIntData(intData2);
-            lastEvent.appendIntData(intData2);
-
-            for (int i=0; i < 1; i++) {
+            for (int i=0; i < 6; i++) {
                 // Write event to file
                 writer.writeEvent(event);
 
-                // Write last event to file
-                //writer.writeEvent(lastEvent);
-
-                System.out.println("Block # = " + writer.getBlockNumber());
+                System.out.println("Event #" + (i+1) + ", Block #" + writer.getBlockNumber());
 
                 // How much room do I have left in the buffer now?
                 if (!useFile) {
@@ -267,41 +167,182 @@ public class FileTest {
                 }
             }
 
-            // All done writing
-            writer.close();
+            writer.writeEvent(event2);
+            System.out.println("Event #7, Block #" + writer.getBlockNumber());
+         //   writer.flush();
+         //   writer.flush();
+         //   writer.flush();
+         //   writer.flush();
 
+            writer.writeEvent(event);
+            System.out.println("Event #8, Block #" + writer.getBlockNumber());
 
-            // Transform segments into banks in 2 different ways
-//            EvioBank segBank1 = StructureTransformer.transform(segShorts, 10);
-//            StructureTransformer T = new StructureTransformer();
-//            EvioBank segBank2 = T.transform(segShorts, 10);
+            if (true) {
+                // All done writing
+                System.out.println("FileTest, call close()");
+                writer.close();
+            }
 
             if (xmlDictionary != null) {
                 EvioXMLDictionary dict = new EvioXMLDictionary(xmlDictionary);
                 NameProvider.setProvider(dict);
             }
+
+//            if (useFile) {
+//                // Mess with the file by removing bytes off the end
+//                // to simulate incomplete writes due to crashes.
+//                //removeBytesFromFileEnd(fileName, 5);
+//
+//                boolean useSequentialRead = false;
+//                //readWrittenData(fileName+"out", useSequentialRead);
+//                readWrittenData(fileName, useSequentialRead);
+//            }
+//            else {
+//                ByteBuffer buf = writer.getByteBuffer();
+//                // remove header + 1 word if closed, else just 1 word
+//                buf.limit(buf.limit() - 84);
+//                Utilities.bufferToFile(fileName+"out", buf, true, false);
+//                readWrittenData(buf);
+//            }
+//
+//            // Append a few more events and reread
+//            System.out.println("call appendEvents");
+//            appendEvents(fileName, event, 3);
+//
+//            readWrittenData(fileName, false);
+//
+
+        }
+        catch (Exception e) {
+            e.printStackTrace();
+        }
+
+    }
+
+
+    static private void removeBytesFromFileEnd(String fileName, int byteCount) {
+
+        try {
+            // Random file access used to read existing file
+            RandomAccessFile rafIn = new RandomAccessFile(fileName, "rw");
+
+            // Random file access used to read existing file
+            RandomAccessFile rafOut = new RandomAccessFile(fileName+"out", "rw");
+
+            // Size of existing file
+            long fileSize = rafIn.length();
+
+            // Size of file to write
+            if (byteCount < 0) byteCount *= -1;
+            long newSize = fileSize - byteCount;
+            System.out.println("File size = " + fileSize + ", reduce to " + newSize);
+
+            for (long l=0L; l < newSize; l++) {
+                //System.out.println("long l = " + l + ", read from in and write to out");
+                rafOut.writeByte(rafIn.readByte());
+            }
+            rafIn.close();
+            rafOut.close();
         }
         catch (IOException e) {
             e.printStackTrace();
         }
-        catch (EvioException e) {
-            e.printStackTrace();
+
+    }
+
+    private static void readWrittenData(ByteBuffer buf)
+            throws IOException, EvioException {
+
+        EvioReader evioReader = new EvioReader(buf);
+
+        // How many events in the file?
+        int evCount = evioReader.getEventCount();
+        System.out.println("\nRead buffer, got " + evCount + " events");
+
+        // Use the "random access" capability to look at last event (starts at 1)
+        EvioEvent ev = evioReader.parseEvent(evCount);
+        System.out.println("Last event = " + ev.toString());
+
+        // Print out any data in the last event.
+        //
+        // In the writing example, the data for this event was set to
+        // be little endian so we need to read it in that way too
+        int[] intData = ev.getIntData();
+        if (intData != null) {
+            for (int i=0; i < 4; i++) {
+                System.out.println("intData[" + i + "] = " + intData[i]);
+            }
         }
 
-        boolean readingFile = false;
+    }
 
-        if (readingFile) {
-            try {
-                EvioReader evioReader;
-                if (useFile) {
-                    System.out.println("read ev file: " + fileName + ", size: " + file.length());
-                    evioReader = new EvioReader(fileName);
-                }
-                else {
-                    myBuf.flip();
-                    evioReader = new EvioReader(myBuf);
-                }
-                EventParser parser = evioReader.getParser();
+
+    private static void readWrittenData(String fileName, boolean sequential)
+            throws IOException, EvioException {
+
+        File file = new File(fileName);
+        EvioReader evioReader = new EvioReader(fileName, false, sequential);
+        System.out.println("read ev file: " + fileName + ", size: " + file.length());
+
+        // How many events in the file?
+        int evCount = evioReader.getEventCount();
+        System.out.println("Read file, got " + evCount + " events:\n");
+
+        // Use the "random access" capability to look at last event (starts at 1)
+        EvioEvent ev = evioReader.parseEvent(evCount);
+        System.out.println("Last event = " + ev.toString());
+
+        // Print out any data in the last event.
+        //
+        // In the writing example, the data for this event was set to
+        // be little endian so we need to read it in that way too
+        //ev.setByteOrder(ByteOrder.LITTLE_ENDIAN);
+        int[] intData = ev.getIntData();
+        if (intData != null) {
+            for (int i=0; i < 4; i++) {
+                System.out.println("intData[" + i + "] = " + intData[i]);
+            }
+        }
+
+        // Use sequential access to events
+//        while ( (ev = evioReader.parseNextEvent()) != null) {
+//            System.out.println("Event = " + ev.toString());
+//        }
+    }
+
+
+    private static void appendEvents(String fileName, EvioEvent ev, int count)
+            throws IOException, EvioException {
+
+        File file = new File(fileName);
+        EventWriter writer = new EventWriter(file, 16, 1000, ByteOrder.nativeOrder(),
+                                             null, null, true, true);
+
+        for (int i=0; i < count; i++) {
+            // append event to file
+            writer.writeEvent(ev);
+            System.out.println("Appended event #" + (i+1) + ", Block #" + writer.getBlockNumber());
+        }
+
+        writer.close();
+    }
+
+
+
+    private static void readWrittenDataOrig(String fileName, File file, ByteBuffer myBuf,
+                                            boolean useFile, EvioEvent event) {
+
+        try {
+            EvioReader evioReader;
+            if (useFile) {
+                System.out.println("read ev file: " + fileName + ", size: " + file.length());
+                evioReader = new EvioReader(fileName);
+            }
+            else {
+                myBuf.flip();
+                evioReader = new EvioReader(myBuf);
+            }
+            EventParser parser = evioReader.getParser();
 
                 IEvioListener listener = new IEvioListener() {
                     public void gotStructure(BaseStructure topStructure, IEvioStructure structure) {
@@ -309,110 +350,112 @@ public class FileTest {
                     }
 
                     public void startEventParse(BaseStructure structure) {
+
                         System.out.println("Starting event parse");
                     }
 
                     public void endEventParse(BaseStructure structure) {
+
                         System.out.println("Ended event parse");
                     }
                 };
 
                 parser.addEvioListener(listener);
 
-                // Get any existing dictionary (should be the same as "xmlDictionary")
-                String xmlDictString = evioReader.getDictionaryXML();
-                EvioXMLDictionary dictionary = null;
+            // Get any existing dictionary (should be the same as "xmlDictionary")
+            String xmlDictString = evioReader.getDictionaryXML();
+            EvioXMLDictionary dictionary = null;
 
-                if (xmlDictString == null) {
-                    System.out.println("Ain't got no dictionary!");
+            if (xmlDictString == null) {
+                System.out.println("Ain't got no dictionary!");
+            }
+            else {
+                // Create dictionary object from xml string
+                dictionary = new EvioXMLDictionary(xmlDictString);
+                System.out.println("Got a dictionary:\n" + dictionary.toString());
+            }
+
+            // How many events in the file?
+            int evCount = evioReader.getEventCount();
+            System.out.println("Read file, got " + evCount + " events:\n");
+
+            // Use the "random access" capability to look at last event (starts at 1)
+            EvioEvent ev = evioReader.parseEvent(evCount);
+            System.out.println("Last event = " + ev.toString());
+
+            // Print out any data in the last event.
+            //
+            // In the writing example, the data for this event was set to
+            // be little endian so we need to read it in that way too
+            ev.setByteOrder(ByteOrder.LITTLE_ENDIAN);
+            int[] intData = ev.getIntData();
+            if (intData != null) {
+                for (int i=0; i < intData.length; i++) {
+                    System.out.println("intData[" + i + "] = " + intData[i]);
                 }
-                else {
-                    // Create dictionary object from xml string
-                    dictionary = new EvioXMLDictionary(xmlDictString);
-                    System.out.println("Got a dictionary:\n" + dictionary.toString());
-                }
+            }
 
-                // How many events in the file?
-                int evCount = evioReader.getEventCount();
-                System.out.println("Read file, got " + evCount + " events:\n");
+            // Use the dictionary
+            if (dictionary != null) {
+                String eventName = dictionary.getName(ev);
+                System.out.println("Name of last event = " + eventName);
+            }
 
-                // Use the "random access" capability to look at last event (starts at 1)
-                EvioEvent ev = evioReader.parseEvent(evCount);
-                System.out.println("Last event = " + ev.toString());
-
-                // Print out any data in the last event.
-                //
-                // In the writing example, the data for this event was set to
-                // be little endian so we need to read it in that way too
-                ev.setByteOrder(ByteOrder.LITTLE_ENDIAN);
-                int[] intData = ev.getIntData();
-                if (intData != null) {
-                    for (int i=0; i < intData.length; i++) {
-                        System.out.println("intData[" + i + "] = " + intData[i]);
-                    }
-                }
-
-                // Use the dictionary
-                if (dictionary != null) {
-                    String eventName = dictionary.getName(ev);
-                    System.out.println("Name of last event = " + eventName);
-                }
-
-                // Use sequential access to events
-                while ( (ev = evioReader.parseNextEvent()) != null) {
-                    System.out.println("Event = " + ev.toString());
-                }
-
-                // Go back to the beginning of file/buffer
-                evioReader.rewind();
-
-                // Search for banks/segs/tagsegs with a particular tag & num pair of values
-                int tag=1, num=1;
-                List<BaseStructure> list = StructureFinder.getMatchingBanks(
-                                                (ev = evioReader.parseNextEvent()), tag, num);
+            // Use sequential access to events
+            while ( (ev = evioReader.parseNextEvent()) != null) {
                 System.out.println("Event = " + ev.toString());
+            }
+
+            // Go back to the beginning of file/buffer
+            evioReader.rewind();
+
+            // Search for banks/segs/tagsegs with a particular tag & num pair of values
+            int tag=1, num=1;
+            List<BaseStructure> list = StructureFinder.getMatchingBanks(
+                    (ev = evioReader.parseNextEvent()), tag, num);
+            System.out.println("Event = " + ev.toString());
+            for (BaseStructure s : list) {
+                if (dictionary == null)
+                    System.out.println("Evio structure named \"" + s.toString() + "\" has tag=1 & num=1");
+                else
+                    System.out.println("Evio structure named \"" + dictionary.getName(s) + "\" has tag=1 & num=1");
+            }
+
+            // ------------------------------------------------------------------
+            // Search for banks/segs/tagsegs with a custom set of search criteria
+            // ------------------------------------------------------------------
+
+            // This filter selects Segment structures that have odd numbered tags.
+            class myEvioFilter implements IEvioFilter {
+                public boolean accept(StructureType structureType, IEvioStructure struct) {
+                    return (structureType == StructureType.SEGMENT &&
+                            (struct.getHeader().getTag() % 2 == 1));
+                }
+            };
+
+            myEvioFilter filter = new myEvioFilter();
+            list = StructureFinder.getMatchingStructures(event, filter);
+            if (list != null) {
+                System.out.println("list size = " + list.size());
                 for (BaseStructure s : list) {
                     if (dictionary == null)
                         System.out.println("Evio structure named \"" + s.toString() + "\" has tag=1 & num=1");
                     else
-                        System.out.println("Evio structure named \"" + dictionary.getName(s) + "\" has tag=1 & num=1");
+                        System.out.println("Evio structure named " + dictionary.getName(s) +
+                                                   " is a segment with an odd numbered tag");
                 }
-
-                // ------------------------------------------------------------------
-                // Search for banks/segs/tagsegs with a custom set of search criteria
-                // ------------------------------------------------------------------
-
-                // This filter selects Segment structures that have odd numbered tags.
-                class myEvioFilter implements IEvioFilter {
-                    public boolean accept(StructureType structureType, IEvioStructure struct) {
-                        return (structureType == StructureType.SEGMENT &&
-                                (struct.getHeader().getTag() % 2 == 1));
-                    }
-                };
-
-                myEvioFilter filter = new myEvioFilter();
-                list = StructureFinder.getMatchingStructures(event, filter);
-                if (list != null) {
-                    System.out.println("list size = " + list.size());
-                    for (BaseStructure s : list) {
-                        if (dictionary == null)
-                            System.out.println("Evio structure named \"" + s.toString() + "\" has tag=1 & num=1");
-                        else
-                            System.out.println("Evio structure named " + dictionary.getName(s) +
-                                           " is a segment with an odd numbered tag");
-                    }
-                }
-
-                // ------------------------------------------------------------------
             }
-            catch (EvioException e) {
-                e.printStackTrace();
-            }
-            catch (IOException e) {
-                e.printStackTrace();
-            }
+
+            // ------------------------------------------------------------------
+        }
+        catch (EvioException e) {
+            e.printStackTrace();
+        }
+        catch (IOException e) {
+            e.printStackTrace();
         }
     }
+
 
 
     /** For testing only */

@@ -23,11 +23,11 @@ using namespace evio;
  * Constructor opens buffer for reading or writing.
  * @param streamBuf Stream buffer specified by the user
  * @param bufLen size of the stream buffer
- * @param m I/O mode, "r" or "ra" or "w" or "a"
+ * @param m I/O mode, "r", "ra", "w", or "a"
  * @param size Internal event buffer size
  */
 evioBufferChannel::evioBufferChannel(uint32_t *streamBuf, int bufLen, const string &m, int size) throw(evioException) 
-  : evioChannel(), streamBuf(streamBuf), streamBufSize(bufLen), mode(m), handle(0), bufSize(size), noCopyBuf(NULL), randomBuf(NULL), 
+  : evioChannel(), streamBuf(streamBuf), streamBufSize(bufLen), mode(m), handle(0), bufSize(size), noCopyBuf(NULL), randomBuf(NULL),
     bufferXMLDictionary(""), createdBufferDictionary(false) {
   if(streamBuf==NULL)throw(evioException(0,"?evioBufferChannel constructor...NULL buffer",__FILE__,__FUNCTION__,__LINE__));
 
@@ -48,7 +48,7 @@ evioBufferChannel::evioBufferChannel(uint32_t *streamBuf, int bufLen, const stri
  * @param streamBuf Stream buffer specified by the user
  * @param bufLen size of the stream buffer
  * @param dict Dictionary
- * @param m I/O mode, "r" or "ra" or "w" or "a"
+ * @param m I/O mode, "r", "ra", "w", or "a"
  * @param size Internal event buffer size
  */
 evioBufferChannel::evioBufferChannel(uint32_t *streamBuf, int bufLen, evioDictionary *dict, const string &m, int size) throw(evioException) 
@@ -89,7 +89,7 @@ void evioBufferChannel::open(void) throw(evioException) {
 
   int stat;
   if(buf==NULL)throw(evioException(0,"evioBufferChannel::open...null buffer",__FILE__,__FUNCTION__,__LINE__));
-  if((stat=evOpenBuffer((char*)streamBuf,streamBufSize,const_cast<char*>(mode.c_str()),&handle))!=S_SUCCESS)
+  if((stat=evOpenBuffer((char*)streamBuf,(uint32_t)streamBufSize,const_cast<char*>(mode.c_str()),&handle))!=S_SUCCESS)
     throw(evioException(stat,"?evioBufferChannel::open...unable to open buffer: " + string(evPerror(stat)),
                         __FILE__,__FUNCTION__,__LINE__));
   if(handle==0)throw(evioException(0,"?evioBufferChannel::open...zero handle",__FILE__,__FUNCTION__,__LINE__));
@@ -98,10 +98,10 @@ void evioBufferChannel::open(void) throw(evioException) {
   // on read check if buffer has dictionary, warn if conflict with user dictionary
   // store buffer XML just in case
   // set dictionary on write
-  if(mode=="r") {
+  if((mode=="r")||(mode=="ra")) {
     char *d;
     uint32_t len;
-    int stat=evGetDictionary(handle,&d,&len);
+    stat=evGetDictionary(handle,&d,&len);
     if((stat==S_SUCCESS)&&(d!=NULL)&&(len>0))bufferXMLDictionary = string(d);
 
     if(dictionary==NULL) {
@@ -134,7 +134,7 @@ bool evioBufferChannel::read(void) throw(evioException) {
   noCopyBuf=NULL;
   if(buf==NULL)throw(evioException(0,"evioBufferChannel::read...null buffer",__FILE__,__FUNCTION__,__LINE__));
   if(handle==0)throw(evioException(0,"evioBufferChannel::read...0 handle",__FILE__,__FUNCTION__,__LINE__));
-  return(evRead(handle,&buf[0],bufSize)==0);
+  return(evRead(handle,&buf[0],(uint32_t)bufSize)==0);
 }
 
 
@@ -151,7 +151,7 @@ bool evioBufferChannel::read(uint32_t *myBuf, int length) throw(evioException) {
   noCopyBuf=NULL;
   if(myBuf==NULL)throw(evioException(0,"evioBufferChannel::read...null user buffer",__FILE__,__FUNCTION__,__LINE__));
   if(handle==0)throw(evioException(0,"evioBufferChannel::read...0 handle",__FILE__,__FUNCTION__,__LINE__));
-  return(evRead(handle,&myBuf[0],length)==0);
+  return(evRead(handle,&myBuf[0],(uint32_t)length)==0);
 }
 
 

@@ -21,10 +21,16 @@
     <groupId>org.jlab.coda</groupId>
 
     <!-- current rolling version using snapshot release -->
-    <version>4.4.6-SNAPSHOT</version>
+    <version>5.2-SNAPSHOT</version>
     
     <!-- Package code into jar file -->
     <packaging>jar</packaging>
+
+    <properties>
+        <!-- Make java version 7 jar -->
+        <maven.compiler.source>1.7</maven.compiler.source>
+        <maven.compiler.target>1.7</maven.compiler.target>
+    </properties>
 
     <!-- build customization -->
     <build>

@@ -1,9 +1,8 @@
 package org.jlab.coda.jevio;
 
+import java.math.BigInteger;
 import java.nio.*;
-import java.nio.charset.CharacterCodingException;
-import java.nio.charset.Charset;
-import java.nio.charset.CharsetDecoder;
+import java.nio.charset.*;
 import java.util.*;
 import java.io.UnsupportedEncodingException;
 import java.io.StringWriter;
@@ -29,9 +28,7 @@ import javax.xml.stream.XMLOutputFactory;
  */
 public abstract class BaseStructure implements Cloneable, IEvioStructure, MutableTreeNode, IEvioWriter {
 
-	/**
-	 * Holds the header of the bank.
-	 */
+	/** Holds the header of the bank. */
 	protected BaseStructureHeader header;
 
     /**
@@ -41,6 +38,25 @@ public abstract class BaseStructure implements Cloneable, IEvioStructure, Mutabl
      */
     protected byte rawBytes[];
 
+	/** Used if raw data should be interpreted as ints. */
+	protected int intData[];
+
+	/** Used if raw data should be interpreted as longs. */
+	protected long longData[];
+
+	/** Used if raw data should be interpreted as shorts. */
+	protected short shortData[];
+
+	/** Used if raw data should be interpreted as doubles. */
+	protected double doubleData[];
+
+    /** Used if raw data should be interpreted as doubles. */
+    protected float floatData[];
+
+    /** Used if raw data should be interpreted as composite type. */
+    protected CompositeData[] compositeData;
+
+    //------------------- STRING STUFF -------------------
     /**
      * Used if raw data should be interpreted as chars.
      * The reason rawBytes is not used directly is because
@@ -51,50 +67,24 @@ public abstract class BaseStructure implements Cloneable, IEvioStructure, Mutabl
      */
     protected byte charData[];
 
-	/**
-	 * Used if raw data should be interpreted as ints.
-	 */
-	protected int intData[];
-
-	/**
-	 * Used if raw data should be interpreted as longs.
-	 */
-	protected long longData[];
-
-	/**
-	 * Used if raw data should be interpreted as shorts.
-	 */
-	protected short shortData[];
-
-	/**
-	 * Used if raw data should be interpreted as doubles.
-	 */
-	protected double doubleData[];
-
-    /**
-     * Used if raw data should be interpreted as doubles.
-     */
-    protected float floatData[];
-
-    /**
-     * Used if raw data should be interpreted as composite type.
-     */
-    protected CompositeData[] compositeData;
-
-    /**
-     * Used if raw data should be interpreted as a string.
-     */
+    /** Used if raw data should be interpreted as a string. */
     protected StringBuilder stringData;
 
-    /**
-     * Used if raw data should be interpreted as a string.
-     */
+    /** Used if raw data should be interpreted as a string. */
     protected ArrayList<String> stringsList;
 
     /**
-     * Keep track of end of the last string added to stringData (including null but not padding).
+     * Keep track of end of the last string added to stringData
+     * (including null but not padding).
      */
     protected int stringEnd;
+
+    /**
+     * True if char data has non-ascii or non-printable characters,
+     * or has too little data to be in proper format.
+     */
+    protected boolean badStringFormat;
+    //----------------------------------------------------
 
     /**
      * The number of stored data items like number of banks, ints, floats, etc.
@@ -110,19 +100,13 @@ public abstract class BaseStructure implements Cloneable, IEvioStructure, Mutabl
     /** Number of bytes to pad short and byte data. */
     private static int[]  padCount  = {0,3,2,1};
 
-    /**
-     * Give the XML output proper indentation.
-     */
+    /** Give the XML output proper indentation. */
     protected String xmlIndent = "";
 
-    /**
-     * Name of this object as an XML element.
-     */
+    /** Name of this object as an XML element. */
     protected String xmlElementName = "unknown";   //TODO: get rid of this init val
 
-    /**
-     * Name of this object's contents as an XML attribute if it is a structure type.
-     */
+    /** Name of this object's contents as an XML attribute if it is a structure type. */
     protected String xmlContentAttributeName = "unknown32";  //TODO: get rid of this init val
 
     /**
@@ -132,25 +116,22 @@ public abstract class BaseStructure implements Cloneable, IEvioStructure, Mutabl
     protected ByteOrder byteOrder;
 
 	/**
-	 * The parent of the structure. If it is an "event", the parent is null. This is used for creating trees for a
-	 * variety of purposes (not necessarily graphical.)
+	 * The parent of the structure. If it is an "event", the parent is null.
+     * This is used for creating trees for a variety of purposes
+     * (not necessarily graphical.)
 	 */
 	private BaseStructure parent;
 
 	/**
-	 * Holds the children of this structure. This is used for creating trees for a variety of purposes
-     * (not necessarily graphical.)
+	 * Holds the children of this structure. This is used for creating trees
+     * for a variety of purposes (not necessarily graphical.)
 	 */
 	protected ArrayList<BaseStructure> children;
 
-    /**
-     * Keep track of whether header length data is up-to-date or not.
-     */
+    /** Keep track of whether header length data is up-to-date or not. */
     protected boolean lengthsUpToDate;
 
-    /**
-     * Is this structure a leaf? Leaves are structures with no children.
-     */
+    /** Is this structure a leaf? Leaves are structures with no children. */
     protected boolean isLeaf = true;
 
 
@@ -252,6 +233,7 @@ public abstract class BaseStructure implements Cloneable, IEvioStructure, Mutabl
                 }
                 break;
 
+            case UNKNOWN32:
             case CHAR8:
             case UCHAR8:
                 if (structure.charData != null) {
@@ -351,6 +333,7 @@ public abstract class BaseStructure implements Cloneable, IEvioStructure, Mutabl
                     }
                     break;
 
+                case UNKNOWN32:
                 case CHAR8:
                 case UCHAR8:
                     if (charData != null) {
@@ -423,8 +406,9 @@ public abstract class BaseStructure implements Cloneable, IEvioStructure, Mutabl
     }
 
 	/**
-	 * A convenience method use instead of "instanceof" to see what type of structure we have. Note: this returns the
-	 * type of this structure, not the type of data (the content type) this structure holds.
+	 * A convenience method use instead of "instanceof" to see what type
+     * of structure we have. Note: this returns the type of this structure,
+     * not the type of data (the content type) this structure holds.
 	 * 
 	 * @return the <code>StructureType</code> of this structure.
 	 * @see StructureType
@@ -432,15 +416,26 @@ public abstract class BaseStructure implements Cloneable, IEvioStructure, Mutabl
 	public abstract StructureType getStructureType();
 
     /**
-     * This is a method that must be filled in by subclasses. Write this structure out as an XML record.
+     * This is a method that must be filled in by subclasses.
+     * Write this structure out as an XML record.
      *
-     * @param xmlWriter the writer used to write the events. It is tied to an open file.
+     * @param xmlWriter the writer used to write the events.
+     *                  It is tied to an open file.
      */
     public abstract void toXML(XMLStreamWriter xmlWriter);
 
+    /**
+     * This is a method that must be filled in by subclasses.
+     * Write this structure out as an XML record.
+     *
+     * @param xmlWriter the writer used to write the events.
+     *                  It is tied to an open file.
+     * @param hex       if true, ints get displayed in hexadecimal
+     */
+    public abstract void toXML(XMLStreamWriter xmlWriter, boolean hex);
+
 	/**
 	 * Get the element name for the structure for writing to XML.
-	 * 
 	 * @return the element name for the structure for writing to XML.
 	 */
 	public abstract String getXMLElementName();
@@ -449,12 +444,19 @@ public abstract class BaseStructure implements Cloneable, IEvioStructure, Mutabl
      * Write this structure out as an XML format string.
      */
     public String toXML() {
+        return toXML(false);
+    }
 
+    /**
+     * Write this structure out as an XML format string.
+     * @param hex if true, ints get displayed in hexadecimal
+     */
+    public String toXML(boolean hex) {
         try {
             StringWriter sWriter = new StringWriter();
             XMLStreamWriter xmlWriter = XMLOutputFactory.newInstance().createXMLStreamWriter(sWriter);
 
-            toXML(xmlWriter);
+            toXML(xmlWriter, hex);
             return sWriter.toString();
         }
         catch (XMLStreamException e) {
@@ -500,10 +502,8 @@ public abstract class BaseStructure implements Cloneable, IEvioStructure, Mutabl
                 xmlElementName = "string"; break;
             case COMPOSITE:
                 xmlElementName = "composite"; break;
-
             case UNKNOWN32:
-                holdingStructureType = true;
-                xmlContentAttributeName = "unknown32";
+                xmlElementName = "unknown32";
                 break;
 
             case TAGSEGMENT:
@@ -604,6 +604,7 @@ public abstract class BaseStructure implements Cloneable, IEvioStructure, Mutabl
 
     /**
      * Obtain a string representation of the structure.
+     * This string is used when displaying the object as a node in JTree widget.
      *
      * @return a string representation of the structure.
      */
@@ -646,7 +647,7 @@ public abstract class BaseStructure implements Cloneable, IEvioStructure, Mutabl
 //        sb.append("  len=");
 //        sb.append(header.length);
         if (rawBytes == null) {
-            sb.append("  dataLen=" + header.padding);
+            sb.append("  dataLen=" + ((header.length - (header.getHeaderLength() - 1))/4));
         }
         else {
             sb.append("  dataLen=");
@@ -684,7 +685,7 @@ public abstract class BaseStructure implements Cloneable, IEvioStructure, Mutabl
      * Get the number of stored data items like number of banks, ints, floats, etc.
      * (not the size in ints or bytes). Some items may be padded such as shorts
      * and bytes. This will tell the meaningful number of such data items.
-     * In the case of containers, returns number of bytes not in header.
+     * In the case of containers, returns number of 32-bit words not in header.
      *
      * @return number of stored data items (not size or length),
      *         or number of bytes if container
@@ -705,6 +706,7 @@ public abstract class BaseStructure implements Cloneable, IEvioStructure, Mutabl
             DataType type = header.getDataType();
 
             switch (type) {
+                case UNKNOWN32:
                 case CHAR8:
                 case UCHAR8:
                     padding = header.getPadding();
@@ -723,6 +725,10 @@ public abstract class BaseStructure implements Cloneable, IEvioStructure, Mutabl
                     divisor = 8; break;
                 case CHARSTAR8:
                     String[] s = getStringData();
+                    if (s ==  null) {
+                        numberDataItems = 0;
+                        break;
+                    }
                     numberDataItems = s.length;
                     break;
                 case COMPOSITE:
@@ -943,12 +949,6 @@ public abstract class BaseStructure implements Cloneable, IEvioStructure, Mutabl
 	public byte[] getByteData() {
 
         switch (header.getDataType()) {
-// for now, NO access to raw data behind stored strings
-//            case CHARSTAR8:
-//                // CHARSTAR8 data is already padded as part if its format.
-//                // If appendStringData() was called, rawBytes was set so we're OK.
-//                return rawBytes;
-//
             case CHAR8:
             case UCHAR8:
                 if (charData == null) {
@@ -969,7 +969,9 @@ public abstract class BaseStructure implements Cloneable, IEvioStructure, Mutabl
      * This is a method from the IEvioStructure Interface. Gets the raw data (ascii) as an
      * array of String objects, if the contents type as indicated by the header is appropriate.
      * For any other behavior, the user should retrieve the data as a byte array and
-     * manipulate it in the exact manner desired.<p>
+     * manipulate it in the exact manner desired. If there are non ascii or non-printing ascii
+     * chars or the bytes or not in evio format, a single String containing everything is returned.<p>
+     *
      * Originally, in evio versions 1, 2 and 3, only one string was stored. Recent changes allow
      * an array of strings to be stored and retrieved. The changes are backwards compatible.
      *
@@ -981,8 +983,6 @@ public abstract class BaseStructure implements Cloneable, IEvioStructure, Mutabl
      * <li>The presence of 1 to 4 ending 4's distinguishes the recent string array version from
      *     the original, single string version.
      * <li>The original version string may be padded with anything after its ending null.
-     * <li>Ending non-printing ascii chars (value < 32, = 127) are not included in the string
-     *     since they are there for padding.
      * </ul>
      *
      * @return the data as an array of String objects if DataType is CHARSTAR8, or <code>null</code>
@@ -1107,13 +1107,15 @@ public abstract class BaseStructure implements Cloneable, IEvioStructure, Mutabl
      *
      * @param rawBytes raw evio string data
      * @param offset offset into raw data array
-     * @return array of Strings or null if processing error
+     * @return array of Strings or null if bad arg or too little data
      */
     static public String[] unpackRawBytesToStrings(byte[] rawBytes, int offset) {
 
-        if (rawBytes == null || offset < 0) return null;
+        if (rawBytes == null) return null;
 
         int length = rawBytes.length - offset;
+        if (offset < 0 || (length < 4)) return null;
+
         StringBuilder stringData = null;
         try {
             // stringData contains all elements of rawBytes
@@ -1121,7 +1123,37 @@ public abstract class BaseStructure implements Cloneable, IEvioStructure, Mutabl
         }
         catch (UnsupportedEncodingException e) { /* will never happen */ }
 
-        return stringBuilderToStrings(stringData);
+        return stringBuilderToStrings(stringData, false);
+    }
+
+
+    /**
+     * This method extracts an array of strings from byte array of raw evio string data.
+     * Don't go beyond the specified max character limit and stop that the first
+     * non-character value.
+     *
+     * @param rawBytes    raw evio string data
+     * @param offset      offset into raw data array
+     * @param maxLength   max length in bytes of valid data in rawBytes array
+     * @return array of Strings or null if bad arg or too little data
+     */
+    static public String[] unpackRawBytesToStrings(byte[] rawBytes, int offset, int maxLength) {
+
+        if (rawBytes == null) return null;
+
+        int length = rawBytes.length - offset;
+        if (offset < 0 || length < 4) return null;
+
+        // Don't read read more than maxLength ASCII characters
+        length = length > maxLength ? maxLength : length;
+
+        StringBuilder stringData = null;
+        try {
+            stringData = new StringBuilder(new String(rawBytes, offset, length, "US-ASCII"));
+        }
+        catch (UnsupportedEncodingException e) { /* will never happen */ }
+
+        return stringBuilderToStrings(stringData, true);
     }
 
 
@@ -1131,64 +1163,40 @@ public abstract class BaseStructure implements Cloneable, IEvioStructure, Mutabl
      * @param buffer  buffer containing evio string data
      * @param pos     position of string data in buffer
      * @param length  length of string data in buffer in bytes
-     * @return array of Strings or null if processing error
+     * @return array of Strings or null if bad arg or too little data
      */
     static public String[] unpackRawBytesToStrings(ByteBuffer buffer, int pos, int length) {
 
-        if (buffer == null || pos < 0 || length < 1) return null;
+        if (buffer == null || pos < 0 || length < 4) return null;
 
         ByteBuffer stringBuf = buffer.duplicate();
         stringBuf.limit(pos+length).position(pos);
 
         StringBuilder stringData = null;
         try {
-            Charset charset = Charset.forName("US-ASCII");
-            CharsetDecoder decoder = charset.newDecoder();
+            CharsetDecoder decoder = Charset.forName("US-ASCII").newDecoder();
             stringData = new StringBuilder(decoder.decode(stringBuf));
         }
-        catch (CharacterCodingException e) {/* should not happen */}
+        catch (CharacterCodingException e) {/* will not happen */}
 
-        return stringBuilderToStrings(stringData);
-    }
-
-     // TODO: try this for performance reasons
-    /**
-     * This method extracts an array of strings from buffer containing raw evio string data.
-     *
-     * @param buffer  buffer containing evio string data
-     * @param pos     position of string data in buffer
-     * @param length  length of string data in buffer in bytes
-     * @return array of Strings or null if processing error
-     */
-    static String[] unpackRawBytesToStringsNew(ByteBuffer buffer, int pos, int length) {
-
-        if (buffer == null || pos < 0 || length < 1) return null;
-
-        int oldPos = buffer.position();
-        int oldLim = buffer.limit();
-
-        StringBuilder stringData = null;
-        try {
-            Charset charset = Charset.forName("US-ASCII");
-            CharsetDecoder decoder = charset.newDecoder();
-            stringData = new StringBuilder(decoder.decode(buffer));
-        }
-        catch (CharacterCodingException e) {/* should not happen */}
-
-        String[] strs = stringBuilderToStrings(stringData);
-        buffer.limit(oldLim).position(oldPos);
-
-        return  strs;
+        return stringBuilderToStrings(stringData, false);
     }
 
 
     /**
      * This method extracts an array of strings from StringBuilder containing string data.
+     * If non-printable chars are found (besides those used to terminate strings),
+     * then 1 string with all characters will be returned. However, if the "onlyGoodChars"
+     * flag is true, 1 string is returned in truncated form without
+     * the bad characters at the end.
      *
-     * @param stringData  buffer containing string data
+     * @param stringData     buffer containing string data
+     * @param onlyGoodChars  if true and non-printable chars found,
+     *                       only 1 string with printable ASCII chars will be returned.
      * @return array of Strings or null if processing error
      */
-    static private String[] stringBuilderToStrings(StringBuilder stringData) {
+    static private String[] stringBuilderToStrings(StringBuilder stringData,
+                                                   boolean onlyGoodChars) {
 
         // Each string is terminated with a null (char val = 0)
         // and in addition, the end is padded by ASCII 4's (char val = 4).
@@ -1198,63 +1206,113 @@ public abstract class BaseStructure implements Cloneable, IEvioStructure, Mutabl
         // After doing so, split at the nulls. Do not use the String
         // method "split" as any empty trailing strings are unfortunately discarded.
 
-        boolean newVersion = true;
-        if (stringData.charAt(stringData.length() - 1) != '\004') {
-            newVersion = false;
+        char c;
+        ArrayList<Integer> nullIndexList = new ArrayList<Integer>(10);
+        int nullCount = 0, goodChars = 0;
+        boolean badFormat = true;
+
+        int length = stringData.length();
+        boolean noEnding4 = false;
+        if (stringData.charAt(length - 1) != '\004') {
+            noEnding4 = true;
         }
 
-        char c;
-        ArrayList<String> stringsList = new ArrayList<String>(20);
-        ArrayList<Integer> nullIndexList = new ArrayList<Integer>(20);
-
-        for (int i=0; i < stringData.length(); i++) {
+        outerLoop:
+        for (int i=0; i < length; i++) {
             c = stringData.charAt(i);
-            if ( c == '\000' ) {
+
+            // If char is a null
+            if (c == 0) {
+                nullCount++;
                 nullIndexList.add(i);
-                // only 1 null terminated string originally in evio v2,3
-                if (!newVersion) {
+                // If evio v2 or 3, only 1 null terminated string exists
+                // and padding is just junk or nonexistent.
+                if (noEnding4) {
+                    badFormat = false;
                     break;
                 }
             }
             // Look for any non-printing/control characters (not including null)
-            // and end the string there. Allow whitespace.
-            else if ( (c < 32 || c == 127) && !Character.isWhitespace(c)) {
-                break;
+            // and end the string there. Allow tab & newline.
+            else if ((c < 32 || c > 126) && c != 9 && c != 10) {
+                if (nullCount < 1) {
+                    badFormat = true;
+                    // Getting garbage before first null.
+                    break;
+                }
+
+                // Already have at least one null & therefore a String.
+                // Now we have junk or non-printing ascii which is
+                // possibly the ending 4.
+
+                // If we have a 4, investigate further to see if format
+                // is entirely valid.
+                if (c == '\004') {
+                    // How many more chars are there?
+                    int charsLeft = length - (i+1);
+
+                    // Should be no more than 3 additional 4's before the end
+                    if (charsLeft > 3) {
+                        badFormat = true;
+                        break;
+                    }
+                    else {
+                        // Check to see if remaining chars are all 4's. If not, bad.
+                        for (int j=1; j <= charsLeft; j++) {
+                            c = stringData.charAt(i+j);
+                            if (c != '\004') {
+                                badFormat = true;
+                                break outerLoop;
+                            }
+                        }
+                        badFormat = false;
+                        break;
+                    }
+                }
+                else {
+                    badFormat = true;
+                    break;
+                }
             }
+
+            // Number of good ASCII chars we have
+            goodChars++;
         }
 
-        // One thing to consider is in the old version, if there is no
-        // null at the end, just pretend like there is one.
+        if (badFormat) {
+            if (onlyGoodChars) {
+                // Return everything in one String WITHOUT garbage
+                return new String[] {stringData.substring(0, goodChars)};
+            }
+            // Return everything in one String including possible garbage
+            return new String[] {stringData.toString()};
+        }
 
-        int firstIndex=0;
+        // If here, raw bytes are in the proper format
+
+        int firstIndex=0, count=0;
+        String[] strings = new String[nullCount];
         for (int nullIndex : nullIndexList) {
-            stringsList.add(stringData.substring(firstIndex, nullIndex));
+            strings[count++] = stringData.substring(firstIndex, nullIndex);
             firstIndex = nullIndex + 1;
         }
 
-        if (stringsList.size() < 1) return null;
-
-        String strs[] = new String[stringsList.size()];
-        stringsList.toArray(strs);
-
-        return strs;
+        return strings;
     }
 
-
     /**
-     * Extract string data from rawBytes array. Make sure rawBytes is in the
-     * proper jevio 4.0 format.
+     * Extract string data from rawBytes array.
      * @return number of strings extracted from bytes
      */
     private int unpackRawBytesToStrings() {
 
-        if (rawBytes == null || rawBytes.length < 4) return 0;
+        badStringFormat = true;
 
-        try {
-            // stringData contains all elements of rawBytes
-            stringData = new StringBuilder(new String(rawBytes, "US-ASCII"));
+        if (rawBytes == null || rawBytes.length < 4) {
+            stringsList = null;
+            stringData = null;
+            return 0;
         }
-        catch (UnsupportedEncodingException e) { /* will never happen */ }
 
         // Each string is terminated with a null (char val = 0)
         // and in addition, the end is padded by ASCII 4's (char val = 4).
@@ -1264,38 +1322,98 @@ public abstract class BaseStructure implements Cloneable, IEvioStructure, Mutabl
         // After doing so, split at the nulls. Do not use the String
         // method "split" as any empty trailing strings are unfortunately discarded.
 
-        boolean newVersion = true;
-        if (stringData.charAt(stringData.length() - 1) != '\004') {
-            newVersion = false;
+        try {
+            // stringData contains all elements of rawBytes.
+            // Most efficient way to convert bytes to chars!
+            stringData = new StringBuilder(new String(rawBytes, "US-ASCII"));
         }
+        catch (UnsupportedEncodingException e) {/* will never happen */}
 
         char c;
-        stringsList = new ArrayList<String>(20);
-        ArrayList<Integer> nullIndexList = new ArrayList<Integer>(20);
+        int nullCount = 0;
+        stringsList = new ArrayList<String>(10);
+        ArrayList<Integer> nullIndexList = new ArrayList<Integer>(10);
 
-        for (int i=0; i < stringData.length(); i++) {
+        int rawLength = rawBytes.length;
+        boolean noEnding4 = false;
+        if (rawBytes[rawLength - 1] != 4) {
+            noEnding4 = true;
+        }
+
+        outerLoop:
+        for (int i=0; i < rawLength; i++) {
             c = stringData.charAt(i);
-            if ( c == '\000' ) {
-//System.out.println("  found null at i = " + i);
+
+            // If char is a null
+            if (c == 0) {
+                nullCount++;
                 nullIndexList.add(i);
-                // only 1 null terminated string originally in evio v2,3
-                if (!newVersion) {
-//System.out.println("  evio version 1-3 string");
+                // If evio v2 or 3, only 1 null terminated string exists
+                // and padding is just junk or nonexistent.
+                if (noEnding4) {
+                    badStringFormat = false;
                     break;
                 }
             }
             // Look for any non-printing/control characters (not including null)
-            // and end the string there. Allow whitespace.
-            else if ( (c < 32 || c == 127) && !Character.isWhitespace(c)) {
-//System.out.println("  found non-printing c = " + (int)c + " at i = " + i);
-                break;
+            // and end the string there. Allow tab and newline whitespace.
+            else if ((c < 32 || c > 126) && c != 9 && c != 10) {
+//System.out.println("unpackRawBytesToStrings: found non-printing c = 0x" +
+//                           Integer.toHexString((int)c) + " at i = " + i);
+                if (nullCount < 1) {
+                    // Getting garbage before first null.
+//System.out.println("BAD FORMAT 1: garbage char before null");
+                    break;
+                }
+
+                // Already have at least one null & therefore a String.
+                // Now we have junk or non-printing ascii which is
+                // possibly the ending 4.
+
+                // If we have a 4, investigate further to see if format
+                // is entirely valid.
+                if (c == '\004') {
+                    // How many more chars are there?
+                    int charsLeft = rawLength - (i+1);
+
+                    // Should be no more than 3 additional 4's before the end
+                    if (charsLeft > 3) {
+//System.out.println("BAD FORMAT 2: too many chars, " + charsLeft + ", after 4");
+                        break;
+                    }
+                    else {
+                        // Check to see if remaining chars are all 4's. If not, bad.
+                        for (int j=1; j <= charsLeft; j++) {
+                            c = stringData.charAt(i+j);
+                            if (c != '\004') {
+//System.out.println("BAD FORMAT 3: padding chars are not all 4's");
+                                break outerLoop;
+                            }
+                        }
+                        badStringFormat = false;
+                        break;
+                    }
+                }
+                else {
+//System.out.println("BAD FORMAT 4: got bad char, ascii val = " + c);
+                    break;
+                }
             }
         }
 
-        // One thing to consider is in the old version, if there is no
-        // null at the end, just pretend like there is one.
+        // What if the raw bytes are all valid ascii with no null or other non-printing chars?
+        // Then format is bad so return everything as one string.
 
-//System.out.println("  split into " + nullIndexList.size() + " strings");
+        // If error, return everything in one String including possible garbage
+        if (badStringFormat) {
+//System.out.println("unpackRawBytesToStrings: bad format, return all chars in 1 string");
+            stringsList.add(stringData.toString());
+            return 1;
+        }
+
+        // If here, raw bytes are in the proper format
+
+//System.out.println("  split into " + nullCount + " strings");
         int firstIndex=0;
         for (int nullIndex : nullIndexList) {
             stringsList.add(stringData.substring(firstIndex, nullIndex));
@@ -1303,40 +1421,10 @@ public abstract class BaseStructure implements Cloneable, IEvioStructure, Mutabl
             firstIndex = nullIndex + 1;
         }
 
-        // set length of everything up to & including last null (not padding)
+        // Set length of everything up to & including last null (not padding)
         stringEnd = firstIndex;
         stringData.setLength(stringEnd);
-//System.out.println("    string = " + stringData.toString());
-
-        // convert this old byte representation into the new one
-        if (!newVersion) {
-            // Add any necessary padding to 4 byte boundaries.
-            // IMPORTANT: There must be at least one '\004'
-            // character at the end. This distinguishes evio
-            // string array version from earlier version.
-            int[] pads = {4,3,2,1};
-            switch (pads[stringData.length()%4]) {
-                case 4:
-                    stringData.append("\004\004\004\004");
-                    break;
-                case 3:
-                    stringData.append("\004\004\004");
-                    break;
-                case 2:
-                    stringData.append("\004\004");
-                    break;
-                case 1:
-                    stringData.append('\004');
-                default:
-            }
-
-            // reset raw data format to new version
-            try {
-                rawBytes = stringData.toString().getBytes("US-ASCII");
-            }
-            catch (UnsupportedEncodingException e) { /* will never happen */ }
-        }
-
+//System.out.println("    good string len = " +stringEnd);
         return stringsList.size();
     }
 
@@ -1596,29 +1684,30 @@ public abstract class BaseStructure implements Cloneable, IEvioStructure, Mutabl
 		return header.getDataType().isStructure();
 	}
 
-	/**
-	 * This calls the xml write for all of a structure's children.
+    /**
+   	 * This calls the xml write for all of a structure's children.
      * It is used for a depth-first traversal through the tree
-	 * when writing an event to xml.
-	 * 
-	 * @param xmlWriter the writer used to write the events. It is tied to an open file.
-	 */
-	protected void childrenToXML(XMLStreamWriter xmlWriter) {
-		if (children == null) {
-			return;
-		}
-        
+   	 * when writing an event to xml.
+   	 *
+   	 * @param xmlWriter the writer used to write the events. It is tied to an open file.
+     * @param hex if true, ints get displayed in hexadecimal
+   	 */
+    protected void childrenToXML(XMLStreamWriter xmlWriter, boolean hex) {
+        if (children == null) {
+            return;
+        }
+
         increaseXmlIndent();
 
-		for (BaseStructure structure : children) {
-			structure.setXmlIndent(xmlIndent);
-            structure.toXML(xmlWriter);
-		}
+        for (BaseStructure structure : children) {
+            structure.setXmlIndent(xmlIndent);
+            structure.toXML(xmlWriter, hex);
+        }
 
         decreaseXmlIndent();
-	}
+    }
 
-	/**
+    /**
 	 * All structures have a common start to their xml writing
 	 * 
 	 * @param xmlWriter the writer used to write the events. It is tied to an open file.
@@ -1638,9 +1727,10 @@ public abstract class BaseStructure implements Cloneable, IEvioStructure, Mutabl
      * All structures close their xml writing the same way, by drilling down to embedded children.
      *
      * @param xmlWriter the writer used to write the events. It is tied to an open file.
+     * @param hex if true, ints get displayed in hexadecimal
      */
-    protected void commonXMLClose(XMLStreamWriter xmlWriter) {
-        childrenToXML(xmlWriter);
+    protected void commonXMLClose(XMLStreamWriter xmlWriter, boolean hex) {
+        childrenToXML(xmlWriter, hex);
         try {
             xmlWriter.writeCharacters("\n");
             xmlWriter.writeCharacters(xmlIndent);
@@ -1652,11 +1742,16 @@ public abstract class BaseStructure implements Cloneable, IEvioStructure, Mutabl
     }
 
 	/**
-	 * All structures have a common data write for their xml writing
-	 * 
+	 * All structures have a common data write for their xml writing.<p>
+     *
+     * Warning: this is essentially duplicated in
+     * {@link Utilities#writeXmlData(EvioNode, int, String, boolean, XMLStreamWriter)}
+     * so any change here needs to be made there too.
+	 *
 	 * @param xmlWriter the writer used to write the events. It is tied to an open file.
+     * @param hex       if true, ints get displayed in hexadecimal
 	 */
-	protected void commonXMLDataWrite(XMLStreamWriter xmlWriter) {
+	protected void commonXMLDataWrite(XMLStreamWriter xmlWriter, boolean hex) {
 
 		// only leafs write data
 		if (!isLeaf()) {
@@ -1675,7 +1770,7 @@ public abstract class BaseStructure implements Cloneable, IEvioStructure, Mutabl
                     if (i%2 == 0) {
                         xmlWriter.writeCharacters(indent);
                     }
-                    s = String.format("%24.16e  ", doubledata[i]);
+                    s = String.format("%25.17g  ", doubledata[i]);
                     xmlWriter.writeCharacters(s);
                 }
 				break;
@@ -1683,58 +1778,152 @@ public abstract class BaseStructure implements Cloneable, IEvioStructure, Mutabl
 			case FLOAT32:
 				float floatdata[] = getFloatData();
                 for (int i=0; i < floatdata.length; i++) {
-                    if (i%2 == 0) {
+                    if (i%4 == 0) {
                         xmlWriter.writeCharacters(indent);
                     }
-                    s = String.format("%14.7e  ", floatdata[i]);
+                    s = String.format("%15.8g  ", floatdata[i]);
                     xmlWriter.writeCharacters(s);
                 }
 				break;
 
 			case LONG64:
-			case ULONG64:
-				long longdata[] = getLongData();
+				long[] longdata = getLongData();
                 for (int i=0; i < longdata.length; i++) {
                     if (i%2 == 0) {
                         xmlWriter.writeCharacters(indent);
                     }
-                    s = String.format("%20d  ", longdata[i]);
+
+                    if (hex) {
+                        s = String.format("0x%016x  ", longdata[i]);
+                    }
+                    else {
+                        s = String.format("%20d  ", longdata[i]);
+                    }
                     xmlWriter.writeCharacters(s);
                 }
 				break;
+
+            case ULONG64:
+                longdata = getLongData();
+                BigInteger bg;
+                for (int i=0; i < longdata.length; i++) {
+                    if (i%2 == 0) {
+                        xmlWriter.writeCharacters(indent);
+                    }
+
+                    if (hex) {
+                        s = String.format("0x%016x  ", longdata[i]);
+                    }
+                    else {
+                        bg = new BigInteger(1, ByteDataTransformer.toBytes(longdata[i], ByteOrder.BIG_ENDIAN));
+                        s = String.format("%20s  ", bg.toString());
+                        // For java version 8+, no BigIntegers necessary:
+                        //s = String.format("%20s  ", Long.toUnsignedString(longdata[i]));
+                    }
+                    xmlWriter.writeCharacters(s);
+                }
+                break;
 
 			case INT32:
-			case UINT32:
-				int intdata[] = getIntData();
+                int[] intdata = getIntData();
                 for (int i=0; i < intdata.length; i++) {
-                    if (i%5 == 0) {
+                    if (i%4 == 0) {
                         xmlWriter.writeCharacters(indent);
                     }
-                    s = String.format("%11d  ", intdata[i]);
+
+                    if (hex) {
+                        s = String.format("0x%08x  ", intdata[i]);
+                    }
+                    else {
+                        s = String.format("%11d  ", intdata[i]);
+                    }
+                    xmlWriter.writeCharacters(s);
+                }
+                break;
+
+			case UINT32:
+				intdata = getIntData();
+                for (int i=0; i < intdata.length; i++) {
+                    if (i%4 == 0) {
+                        xmlWriter.writeCharacters(indent);
+                    }
+
+                    if (hex) {
+                        s = String.format("0x%08x  ", intdata[i]);
+                    }
+                    else {
+                        s = String.format("%11d  ", ((long) intdata[i]) & 0xffffffffL);
+                        //s = String.format("%11s  ", Integer.toUnsignedString(intdata[i]));
+                    }
                     xmlWriter.writeCharacters(s);
                 }
 				break;
 
-			case SHORT16:
-			case USHORT16:
-				short shortdata[] = getShortData();
+            case SHORT16:
+                short[] shortdata = getShortData();
                 for (int i=0; i < shortdata.length; i++) {
-                    if (i%5 == 0) {
+                    if (i%8 == 0) {
                         xmlWriter.writeCharacters(indent);
                     }
-                    s = String.format("%6d  ", shortdata[i]);
+
+                    if (hex) {
+                        s = String.format("0x%04x  ", shortdata[i]);
+                    }
+                    else {
+                        s = String.format("%6d  ", shortdata[i]);
+                    }
+                    xmlWriter.writeCharacters(s);
+                }
+                break;
+
+            case USHORT16:
+				shortdata = getShortData();
+                for (int i=0; i < shortdata.length; i++) {
+                    if (i%8 == 0) {
+                        xmlWriter.writeCharacters(indent);
+                    }
+
+                    if (hex) {
+                        s = String.format("0x%04x  ", shortdata[i]);
+                    }
+                    else {
+                        s = String.format("%6d  ", ((int) shortdata[i]) & 0xffff);
+                    }
                     xmlWriter.writeCharacters(s);
                 }
 				break;
 
 			case CHAR8:
-			case UCHAR8:
-				byte bytedata[] = getByteData();
+                byte[] bytedata = getByteData();
                 for (int i=0; i < bytedata.length; i++) {
-                    if (i%5 == 0) {
+                    if (i%8 == 0) {
                         xmlWriter.writeCharacters(indent);
                     }
-                    s = String.format("%4d  ", bytedata[i]);
+
+                    if (hex) {
+                        s = String.format("0x%02x  ", bytedata[i]);
+                    }
+                    else {
+                        s = String.format("%4d  ", bytedata[i]);
+                    }
+                    xmlWriter.writeCharacters(s);
+                }
+                break;
+
+            case UNKNOWN32:
+			case UCHAR8:
+                bytedata = getByteData();
+                for (int i=0; i < bytedata.length; i++) {
+                    if (i%8 == 0) {
+                        xmlWriter.writeCharacters(indent);
+                    }
+
+                    if (hex) {
+                        s = String.format("0x%02x  ", bytedata[i]);
+                    }
+                    else {
+                        s = String.format("%4d  ", ((short) bytedata[i]) & 0xff);
+                    }
                     xmlWriter.writeCharacters(s);
                 }
 				break;
@@ -1742,7 +1931,7 @@ public abstract class BaseStructure implements Cloneable, IEvioStructure, Mutabl
 			case CHARSTAR8:
                 String stringdata[] = getStringData();
                 for (String str : stringdata) {
-                    xmlWriter.writeCharacters("\n");
+                    xmlWriter.writeCharacters(indent);
                     xmlWriter.writeCData(str);
                 }
 				break;
@@ -1757,8 +1946,8 @@ public abstract class BaseStructure implements Cloneable, IEvioStructure, Mutabl
                     }
                 }
 
-                for (int i=0; i < compositeData.length; i++) {
-                    compositeData[i].toXML(xmlWriter, this, true);
+                for (CompositeData cd : compositeData) {
+                    cd.toXML(xmlWriter, this, hex);
                 }
                 break;
 
@@ -1810,12 +1999,23 @@ public abstract class BaseStructure implements Cloneable, IEvioStructure, Mutabl
 
 			case SHORT16:
 			case USHORT16:
-			    datalen = 1 + (getNumberDataItems() - 1) / 2;
+                int items = getNumberDataItems();
+                if (items == 0) {
+                    datalen = 0;
+                    break;
+                }
+                datalen = 1 + (items - 1) / 2;
 				break;
 
+            case UNKNOWN32:
             case CHAR8:
             case UCHAR8:
-                datalen = 1 + (getNumberDataItems() - 1) / 4;
+                items = getNumberDataItems();
+                if (items == 0) {
+                    datalen = 0;
+                    break;
+                }
+                datalen = 1 + (items - 1) / 4;
                 break;
 
             case CHARSTAR8: // rawbytes contain ascii, already padded
@@ -1828,8 +2028,8 @@ public abstract class BaseStructure implements Cloneable, IEvioStructure, Mutabl
             default:
             } // switch
 		} // isleaf
-		return datalen;
 
+		return datalen;
 	}
 
     /**
@@ -1878,45 +2078,6 @@ public abstract class BaseStructure implements Cloneable, IEvioStructure, Mutabl
         }
     }
 
-	/**
-	 * Compute and set length of all header fields for this structure and all its descendants.
-     * For writing events, this will be crucial for setting the values in the headers.
-	 * 
-	 * @return the length that would go in the header field (for a leaf).
-	 */
-	public int setAllHeaderLengthsSemiOrig() throws EvioException {
-        // if length info is current, don't bother to recalculate it
-        if (lengthsUpToDate) {
-            return header.getLength();
-        }
-
-		int datalen;
-
-		if (isLeaf()) {
-            // # of 32 bit ints for leaves, 0 for empty containers (also considered leaves)
-			datalen = dataLength();
-		}
-		else {
-			datalen = 0;
-
-			if (children == null) {
-System.err.println("Non leaf with null children!");
-				System.exit(1);
-			}
-			for (BaseStructure child : children) {
-				datalen += child.setAllHeaderLengths();
-				datalen++; // for the length word of each child
-			}
-		}
-
-        datalen += header.getHeaderLength() - 1; // length header word
-
-		// set the datalen for the header
-		header.setLength(datalen);
-        lengthsUpToDate(true);
-		return datalen;
-	}
-
     /**
      * Compute and set length of all header fields for this structure and all its descendants.
      * For writing events, this will be crucial for setting the values in the headers.
@@ -1959,7 +2120,7 @@ System.err.println("Non leaf with null children!");
         }
 
         datalen += len;
-//System.out.println("len = " + datalen);
+
         // set the datalen for the header
         header.setLength(datalen);
         lengthsUpToDate(true);
@@ -2092,6 +2253,7 @@ System.err.println("Non leaf with null children!");
 				}
 				break;
 
+            case UNKNOWN32:
 			case CHAR8:
 			case UCHAR8:
                 if (rawBytes != null) {
@@ -2568,7 +2730,8 @@ System.err.println("Non leaf with null children!");
      * is the same as setting the data. Don't worry about checking for size limits since
      * jevio structures will never contain a char array > {@link Integer#MAX_VALUE} in size.
      * @param s the strings to append (as ascii), or set if there is no existing data.
-     * @throws EvioException if adding data to a structure of a different data type
+     * @throws EvioException if adding data to a structure of a different data type or to
+     *                       badly formatted (not proper evio) data.
      */
     public void appendStringData(String[] s) throws EvioException {
 
@@ -2581,15 +2744,19 @@ System.err.println("Non leaf with null children!");
             return;
         }
 
+        if (badStringFormat) {
+            throw new EvioException("cannot add to badly formatted string data");
+        }
+
         // if no existing data ...
         if (stringData == null) {
 		    // if no raw data, things are easy
             if (rawBytes == null) {
                 // create some storage
-                stringsList = new ArrayList<String>(s.length > 20 ? s.length + 20 : 20);
-                int len = 3; // max padding
-                for (int i=0; i < s.length; i++) {
-                    len += s.length + 1;
+                stringsList = new ArrayList<String>(s.length > 10 ? s.length : 10);
+                int len = 4; // max padding
+                for (String st : s) {
+                    len += st.length() + 1;
                 }
                 stringData = new StringBuilder(len);
                 numberDataItems = s.length;
@@ -2597,6 +2764,10 @@ System.err.println("Non leaf with null children!");
             // otherwise expand raw data first, then add string
             else {
                 unpackRawBytesToStrings();
+                // Check to see if unpacking was successful before proceeding
+                if (badStringFormat) {
+                    throw new EvioException("cannot add to badly formatted string data");
+                }
                 // remove any existing padding
                 stringData.delete(stringEnd, stringData.length());
                 numberDataItems = stringsList.size() + s.length;
@@ -2608,12 +2779,12 @@ System.err.println("Non leaf with null children!");
             numberDataItems += s.length;
         }
 
-        for (int i=0; i < s.length; i++) {
+        for (String st : s) {
             // store string
-            stringsList.add(s[i]);
+            stringsList.add(st);
 
             // add string
-            stringData.append(s[i]);
+            stringData.append(st);
 
             // add ending null
             stringData.append('\000');

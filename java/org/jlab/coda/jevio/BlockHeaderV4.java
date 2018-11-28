@@ -46,12 +46,13 @@ import java.util.BitSet;
  *                           NOTE: this value should not be used to parse the following
  *                           events since the first block may have a dictionary whose
  *                           presence is not included in this count.
- *      Reserved 1         = If bits 2-5 in bit info are RocRaw (1), then (in the first block)
+ *      Reserved 1         = If bits 11-14 in bit info are RocRaw (1), then (in the first block)
  *                           this contains the CODA id of the source
  *      Bit info & Version = Lowest 8 bits are the version number (4).
  *                           Upper 24 bits contain bit info.
  *                           If a dictionary is included as the first event, bit #9 is set (=1)
  *                           If a last block, bit #10 is set (=1)
+ *      Reserved 2         = unused
  *      Magic Int          = magic number (0xc0da0100) used to check endianness
  *
  *
@@ -62,12 +63,15 @@ import java.util.BitSet;
  *   Bit  10    = true if this block is the last block in file or network transmission
  *
  *   Bits 11-14 = type of events following (ROC Raw = 0, Physics = 1, PartialPhysics = 2,
- *                DisentangledPhysics = 3, User = 4, Control = 5, Prestart = 6, Go = 7,
- *                Pause = 8, End = 9, Other = 15).
+ *                DisentangledPhysics = 3, User = 4, Control = 5, Other = 15).
  *
- *                This is useful ONLY for the CODA online use of evio.
+ *   Bit 15     = true if next (non-dictionary) event in this block is a "first event" to
+ *                be placed at the beginning of each written file and its splits.
+ *
+ *                Bits 11-15 are useful ONLY for the CODA online use of evio.
  *                That's because only a single CODA event type is placed into
- *                a single ET buffer. That ET buffer then is parsed by an EvioReader or
+ *                a single (ET, cMsg) buffer, and each user or control event has its own
+ *                buffer as well. That buffer then is parsed by an EvioReader or
  *                EvioCompactReader object. Thus all events will be of a single CODA type.
  *
  *
@@ -89,6 +93,12 @@ public class BlockHeaderV4 implements Cloneable, IEvioWriter, IBlockHeader {
 
     /** "Last block" is 10th bit in version/info word */
     public static final int EV_LASTBLOCK_MASK  = 0x200;
+
+    /** "Event type" is 11-14th bits` in version/info word */
+    public static final int EV_EVENTTYPE_MASK  = 0x3C00;
+
+    /** "First event" is 15th bit in version/info word */
+    public static final int EV_FIRSTEVENT_MASK  = 0x4000;
 
     /** Position of word for size of block in 32-bit words. */
     public static final int EV_BLOCKSIZE = 0;
@@ -214,6 +224,7 @@ public class BlockHeaderV4 implements Cloneable, IEvioWriter, IBlockHeader {
         eventCount   = blkHeader.eventCount;
         reserved1    = blkHeader.reserved1;
         reserved2    = blkHeader.reserved2;
+        byteOrder    = blkHeader.byteOrder;
         magicNumber  = blkHeader.magicNumber;
         bitInfo      = (BitSet)  blkHeader.bitInfo.clone();
         bufferStartingPosition = blkHeader.bufferStartingPosition;
@@ -316,7 +327,7 @@ public class BlockHeaderV4 implements Cloneable, IEvioWriter, IBlockHeader {
 
     /**
      * Sets the evio version. Should be 4 but no check is performed here, see
-     * {@link EvioReader#nextBlockHeader()}.
+     * {@link EvioReader#processNextBlock()}.
      *
      * @param version the evio version of evio.
      */
@@ -328,14 +339,14 @@ public class BlockHeaderV4 implements Cloneable, IEvioWriter, IBlockHeader {
      * Does this integer indicate that there is an evio dictionary
      * (assuming it's the header's sixth word)?
      *
-     * @return <code>true</code> if this int's indicates an evio dictionary, else <code>false</code>
+     * @return <code>true</code> if this int indicates an evio dictionary, else <code>false</code>
      */
     static public boolean hasDictionary(int i) {
         return ((i & EV_DICTIONARY_MASK) > 0);
     }
 
     /**
-     * Is this block's first event is an evio dictionary?
+     * Is this block's first event an evio dictionary?
      *
      * @return <code>true</code> if this block's first event is an evio dictionary, else <code>false</code>
      */
@@ -344,7 +355,7 @@ public class BlockHeaderV4 implements Cloneable, IEvioWriter, IBlockHeader {
     }
 
     /**
-     * Is this the last block in the file or being sent over the network?
+     * Is this the last block in the file/buffer or being sent over the network?
      *
      * @return <code>true</code> if this is the last block in the file or being sent
      *         over the network, else <code>false</code>
@@ -354,10 +365,18 @@ public class BlockHeaderV4 implements Cloneable, IEvioWriter, IBlockHeader {
     }
 
     /**
+     * Does this block in the file contain the "first event" (first event
+     * to be written to each file split)?
+     *
+     * @return <code>true</code> if this is the first event, else <code>false</code>
+     */
+    public boolean hasFirstEvent() { return bitInfo.get(6); }
+
+    /**
      * Does this integer indicate that this is the last block
      * (assuming it's the header's sixth word)?
      *
-     * @return <code>true</code> if this int's indicates the last block, else <code>false</code>
+     * @return <code>true</code> if this int indicates the last block, else <code>false</code>
      */
     static public boolean isLastBlock(int i) {
         return ((i & EV_LASTBLOCK_MASK) > 0);
@@ -373,7 +392,7 @@ public class BlockHeaderV4 implements Cloneable, IEvioWriter, IBlockHeader {
     }
 
     /**
-     * Clear the last-block bit in the given arg to indicate it is NOT the last block.
+     * Clear the bit in the given arg to indicate it is NOT the last block.
      * @param i integer in which to clear the last-block bit
      * @return arg with last-block bit cleared
      */
@@ -381,6 +400,35 @@ public class BlockHeaderV4 implements Cloneable, IEvioWriter, IBlockHeader {
         return (i &= ~EV_LASTBLOCK_MASK);
     }
 
+    /**
+     * Does this integer indicate that block has the first event
+     * (assuming it's the header's sixth word)? Only makes sense if the
+     * integer arg comes from the first block header of a file or buffer.
+     *
+     * @return <code>true</code> if this int indicates the block has a first event,
+     *         else <code>false</code>
+     */
+    static public boolean hasFirstEvent(int i) {
+        return ((i & EV_FIRSTEVENT_MASK) > 0);
+    }
+
+    /**
+     * Set the bit in the given arg which indicates this block has a first event.
+     * @param i integer in which to set the last-block bit
+     * @return  arg with first event bit set
+     */
+    static public int setFirstEventBit(int i)   {
+        return (i |= EV_FIRSTEVENT_MASK);
+    }
+
+    /**
+     * Clear the bit in the given arg to indicate this block does NOT have a first event.
+     * @param i integer in which to clear the first event bit
+     * @return arg with first event bit cleared
+     */
+    static public int clearFirstEventBit(int i) {
+        return (i &= ~EV_FIRSTEVENT_MASK);
+    }
 
     /**
      * Get the value of bits 2-5. It represents the type of event being sent.
@@ -395,6 +443,37 @@ public class BlockHeaderV4 implements Cloneable, IEvioWriter, IBlockHeader {
             if (bitSet) type |= 1 << i;
         }
         return type;
+    }
+
+    /**
+     * Encode the "is first event" into the bit info word
+     * which will be in evio block header.
+     *
+     * @param bSet bit set which will become part of the bit info word
+     */
+    static public void setFirstEvent(BitSet bSet) {
+        if (bSet == null || bSet.size() < 7) {
+            return;
+        }
+
+        // Encoding bit #15 (#6 since first is bit #9)
+        bSet.set(6, true);
+    }
+
+
+    /**
+     * Encode the "is NOT first event" into the bit info word
+     * which will be in evio block header.
+     *
+     * @param bSet bit set which will become part of the bit info word
+     */
+    static public void unsetFirstEvent(BitSet bSet) {
+        if (bSet == null || bSet.size() < 7) {
+            return;
+        }
+
+        // Encoding bit #15 (#6 since first is bit #9)
+        bSet.set(6, false);
     }
 
     /**
@@ -588,20 +667,6 @@ public class BlockHeaderV4 implements Cloneable, IEvioWriter, IBlockHeader {
         }
     }
 
-    /**
-     * Parses the argument into the bit info fields and looks to see
-     * if the the "has dictionary" bit is set.
-     *
-     * @param word integer to parse into bit info fields
-     * @return <code>true</code> if word's "has dictionary" bit is set
-     */
-    public static boolean bitInfoHasDictionary(int word) {
-        BitSet bitInfo = new BitSet(24);
-        for (int i=0; i < 24; i++) {
-            bitInfo.set(i, ((word >>> 8+i) & 0x1) > 0);
-        }
-        return bitInfo.get(0);
-    }
 
     /**
      * Get the first reserved word.

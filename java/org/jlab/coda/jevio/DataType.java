@@ -34,14 +34,16 @@ public enum DataType {
 	BANK           (0x10),
 	SEGMENT        (0x20),
 
-    //  Remove ALSOTAGSEGMENT (0x40) since it was never
+    //  Removed ALSOTAGSEGMENT (0x40) since it was never
     //  used and we now need that to store padding data.
     //	ALSOTAGSEGMENT (0x40),
 
     // These 2 types are only used when dealing with COMPOSITE data.
     // They are never transported independently and are stored in integers.
     HOLLERIT       (0x21),
-    NVALUE         (0x22);
+	NVALUE         (0x22),
+	nVALUE         (0x23),
+	mVALUE         (0x24);
 
 
     /** Each name is associated with a specific evio integer value. */
@@ -54,7 +56,7 @@ public enum DataType {
 
     // Fill array after all enum objects created
     static {
-        intToType = new DataType[0x42 + 1];
+        intToType = new DataType[0x24 + 1];
         for (DataType type : values()) {
             intToType[type.value] = type;
         }
@@ -68,7 +70,7 @@ public enum DataType {
 	 * @return the matching enum, or <code>null</code>.
 	 */
     public static DataType getDataType(int val) {
-        if (val > 0x42 || val < 0) return null;
+        if (val > 0x24 || val < 0) return null;
         return intToType[val];
     }
 
@@ -80,7 +82,7 @@ public enum DataType {
      * @return the name, or "UNKNOWN".
      */
     public static String getName(int val) {
-        if (val > 0x42 || val < 0) return "UNKNOWN";
+        if (val > 0x24 || val < 0) return "UNKNOWN";
         DataType type = getDataType(val);
         if (type == null) return "UNKNOWN";
         return type.name();
@@ -139,23 +141,79 @@ public enum DataType {
 		}
 	}
 
-    /**
-   	 * Convenience routine to see if the given integer arg represents a data type which
+	/**
+	 * Convenience routine to see if "this" data type is a bank structure.
+	 * @return <code>true</code> if this data type corresponds to a bank structure.
+	 */
+	public boolean isBank() {return (this == BANK || this == ALSOBANK);}
+
+//	/**
+//	 * Convenience routine to see if the given integer arg represents a data type which
+//     * is a structure (a container).
+//	 * @return <code>true</code> if the data type corresponds to one of the structure
+//	 * types: BANK, SEGMENT, or TAGSEGMENT.
+//	 */
+//	static public boolean isStructure(int dataType) {
+//		return  dataType == BANK.value    || dataType == ALSOBANK.value    ||
+//				dataType == SEGMENT.value || dataType == ALSOSEGMENT.value ||
+//				dataType == TAGSEGMENT.value;
+//	}
+
+	/**
+	 * Convenience routine to see if the given integer arg represents a data type which
      * is a structure (a container).
-   	 * @return <code>true</code> if the data type corresponds to one of the structure
-   	 * types: BANK, SEGMENT, or TAGSEGMENT.
-   	 */
-   	static public boolean isStructure(int dataType) {
-   		switch (getDataType(dataType)) {
-   		case BANK:
-   		case SEGMENT:
-   		case TAGSEGMENT:
-   		case ALSOBANK:
-   		case ALSOSEGMENT:
-   			return true;
-   		default:
-   			return false;
-   		}
-   	}
+	 * @return <code>true</code> if the data type corresponds to one of the structure
+	 * types: BANK, SEGMENT, or TAGSEGMENT.
+	 */
+	static public boolean isStructure(int dataType) {
+		return  ((dataType > 0xb && dataType < 0x11) || dataType == 0x20);
+	}
+
+	/**
+	 * Convenience routine to see if the given integer arg represents a BANK.
+	 * @return <code>true</code> if the data type corresponds to a BANK.
+	 */
+	static public boolean isBank(int dataType) {
+		return BANK.value == dataType || ALSOBANK.value == dataType;
+	}
+
+	/**
+	 * Convenience routine to see if the given integer arg represents a SEGMENT.
+	 * @return <code>true</code> if the data type corresponds to a SEGMENT.
+	 */
+	static public boolean isSegment(int dataType) {
+		return SEGMENT.value == dataType || ALSOSEGMENT.value == dataType;
+	}
+
+	/**
+	 * Convenience routine to see if the given integer arg represents a TAGSEGMENT.
+	 * @return <code>true</code> if the data type corresponds to a TAGSEGMENT.
+	 */
+	static public boolean isTagSegment(int dataType) {
+		return TAGSEGMENT.value == dataType;
+	}
+
+	/**
+	 * Convenience routine to see if "this" data type is an integer of some kind -
+	 * either 8, 16, 32, or 64 bits worth.
+	 * @return <code>true</code> if the data type corresponds to an integer type
+	 */
+	public boolean isInteger() {
+		switch (this) {
+		case UCHAR8:
+		case CHAR8:
+		case USHORT16:
+		case SHORT16:
+		case UINT32:
+	    case INT32:
+		case ULONG64:
+		case LONG64:
+			return true;
+		default:
+			return false;
+		}
+	}
+
+
 
 }
