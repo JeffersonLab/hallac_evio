@@ -11,3 +11,12 @@ doc/doxygen/C/
 doc/doxygen/CC/
 doc/javadoc/
 doxyerrors.log
+# scons stuff
+*.pyc
+.sconsign.dblite
+# ignore build directories, e.g. .Linux-x86_64
+src/examples/.???*
+src/exesrc/.???*
+src/libsrc/.???*
+src/libsrc++/.???*
+src/test/.???*
