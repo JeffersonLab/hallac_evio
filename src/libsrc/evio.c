@@ -377,9 +377,9 @@ static  int      generatePointerTable(EVFILE *a);
 /* Array that holds all pointers to structures created with evOpen().
  * Space in the array is allocated as needed, beginning with 100
  * and adding 50% every time more are needed. */
-static EVFILE **handleList = NULL;
+EVFILE **handleList = NULL;
 /* The number of handles available for use. */
-static int handleCount = 0;
+int handleCount = 0;
 
 #ifndef VXWORKS
     /* Pthread mutex for serializing calls to get and free handles. */

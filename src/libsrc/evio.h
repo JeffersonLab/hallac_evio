@@ -230,6 +230,16 @@ typedef struct evioBlockHeaderV4_t {
 /** Offset in bytes from beginning of block header to magic number. */
 #define EVIO_BH_MAGNUM_OFFSET 224
 
+/* Array that holds all pointers to structures created with evOpen().
+ * Space in the array is allocated as needed, beginning with 100
+ * and adding 50% every time more are needed. */
+//static EVFILE **handleList = NULL;
+/* The number of handles available for use. */
+//static int handleCount = 0;
+extern EVFILE **handleList;
+/* The number of handles available for use. */
+extern int handleCount;
+
 /* prototypes */
 #ifdef __cplusplus
 extern "C" {
