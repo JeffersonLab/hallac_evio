@@ -17,7 +17,6 @@
 #include <string>
 #include <iostream>
 #include "evioException.hxx"
-#include "evioDictionary.hxx"
 
 #if defined(__GNUC__) || defined(__clang__)
 # define _MAYBE_UNUSED __attribute__((unused))
@@ -78,8 +77,11 @@ namespace evio {
 
     public:
         // These methods need to call setFormat and setDescription which should be private
-        friend  void evioDictionary::startElementHandler(void *userData, const char *xmlname, const char **atts);
-        friend  void evioDictionary::charDataHandler(void *userData, const char *s, int len);
+        //2-Aug-19: this does not work, otherwise evioDictionary and evioDictEntry would have a circular
+        // dependence on each other
+        //friend  void evioDictionary::startElementHandler(void *userData, const char *xmlname, const char **atts);
+        //friend  void evioDictionary::charDataHandler(void *userData, const char *s, int len);
+        friend class evioDictionary;
 
         evioDictEntry();
         evioDictEntry(uint16_t tag);

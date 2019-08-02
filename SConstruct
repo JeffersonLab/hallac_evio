@@ -143,8 +143,8 @@ env.Append(CCFLAGS = ['-Wall', '-Wextra', '-pedantic', '-Wno-unused-parameter'])
 
 if platform == 'Darwin':
     execLibs = ['pthread', 'dl', 'expat', 'z']
-    #env.Append(CPPDEFINES = ['Darwin'], SHLINKFLAGS = ['-multiply_defined','suppress','-undefined','dynamic_lookup'])
-    env.Append(CPPDEFINES = ['Darwin'], SHLINKFLAGS = ['-multiply_defined', '-undefined', '-flat_namespace'])
+    env.Append(CPPDEFINES = ['Darwin'], SHLINKFLAGS = ['-multiply_defined','suppress','-undefined','dynamic_lookup'])
+    #env.Append(CPPDEFINES = ['Darwin'], SHLINKFLAGS = ['-multiply_defined', '-undefined', '-flat_namespace'])
     env.Append(CCFLAGS = ['-fmessage-length=0'])
 
 

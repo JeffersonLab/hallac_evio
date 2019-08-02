@@ -14,6 +14,7 @@ doxyerrors.log
 # scons stuff
 *.pyc
 .sconsign.dblite
+config.log
 # ignore build directories, e.g. .Linux-x86_64
 src/examples/.???*
 src/exesrc/.???*

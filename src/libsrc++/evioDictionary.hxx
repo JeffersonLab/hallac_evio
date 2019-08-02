@@ -36,7 +36,7 @@
 #define _evioDictionary_hxx
 
 
-//#include "evioDictEntry.hxx"
+#include "evioDictEntry.hxx"
 #include "evioTypedefs.hxx"
 #include "evioException.hxx"
 
@@ -55,7 +55,6 @@ using namespace evio;
 const string dictEntryTag = "dictentry";
 const string oldDictEntryTag = "xmldumpdictdntry";
 
-class evioDictEntry;
 
 /**
  * This class parses XML dictionary string and contains maps for looking up dictionary information.
