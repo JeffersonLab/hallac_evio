@@ -4656,8 +4656,13 @@ static int evWriteImpl(int handle, const uint32_t *buffer, int useMutex)
     bytesToWrite = 4 * wordsToWrite;
 
     if (debug && a->splitting) {
+#if defined(__x86_64__) && defined(__clang__)
+printf("evWrite: splitting, bytesToFile = %llu, event bytes = %u, bytesToBuf = %u, split = %llu\n",
+               a->bytesToFile, bytesToWrite, a->bytesToBuf, a->split);
+#else
 printf("evWrite: splitting, bytesToFile = %lu, event bytes = %u, bytesToBuf = %u, split = %lu\n",
                a->bytesToFile, bytesToWrite, a->bytesToBuf, a->split);
+#endif
 printf("evWrite: blockNum = %u, (blkNum == 2) = %d, eventsToBuf (%u)  <=? common blk cnt (%u)\n",
        a->blknum, (a->blknum == 2),  a->eventsToBuf,  a->commonBlkCount);
     }
@@ -4701,10 +4706,15 @@ if (debug) printf("evWrite: don't split file cause only common block written so 
         }
 
 if (debug) {
+#if defined(__x86_64__) && defined(__clang__)
+    printf("evWrite: splitting = %s: total size = %llu >? split = %llu\n",
+           (totalSize > a->split ? "True" : "False"), totalSize, a->split);
+    printf("evWrite: total size components: bytesToFile = %llu, bytesToBuf = %u, ev bytes = %u, dictlen = %u\n",
+#else
     printf("evWrite: splitting = %s: total size = %lu >? split = %lu\n",
            (totalSize > a->split ? "True" : "False"), totalSize, a->split);
-
     printf("evWrite: total size components: bytesToFile = %lu, bytesToBuf = %u, ev bytes = %u, dictlen = %u\n",
+#endif
            a->bytesToFile, a->bytesToBuf, bytesToWrite, a->dictLength);
 }
 
@@ -4885,7 +4895,11 @@ if (debug) {
         printf("         common block cnt = %u\n", a->commonBlkCount);
         printf("         current block cnt (dict) = %u\n", a->blkEvCount);
         printf("         bytes-to-buf  = %u\n", a->bytesToBuf);
+#if defined(__x86_64__) && defined(__clang__)
+        printf("         bytes-to-file = %llu\n", a->bytesToFile);
+#else
         printf("         bytes-to-file = %lu\n", a->bytesToFile);
+#endif
         printf("         block # = %u\n", a->blknum);
 }
 
@@ -5125,7 +5139,11 @@ printf("    flushToFile: will not overwrite file = %s\n", a->fileName);
         printf("         internal buffer cnt (dict) = %u\n", a->eventsToBuf);
         printf("         current block cnt (dict) = %u\n", a->blkEvCount);
         printf("         bytes-written = %u\n", bytesToWrite);
+#if defined(__x86_64__) && defined(__clang__)
+        printf("         bytes-to-file = %llu\n", a->bytesToFile);
+#else
         printf("         bytes-to-file = %lu\n", a->bytesToFile);
+#endif
         printf("         block # = %u\n", a->blknum);
     }
 
@@ -5829,13 +5847,21 @@ if (debug) printf("evIoctl: increasing internal buffer size to %u words\n", buff
             /* Smallest possible evio format file = 10 32-bit ints.
              * Must also be bigger than a single buffer? */
             if (splitSize < 4*10) {
+#if defined(__x86_64__) && defined(__clang__)
+if (debug) printf("evIoctl: split file size is too small! (%llu bytes), must be min 40\n", splitSize);
+#else
 if (debug) printf("evIoctl: split file size is too small! (%lu bytes), must be min 40\n", splitSize);
+#endif
                 handleUnlock(handle);
                 return(S_EVFILE_BADSIZEREQ);
             }
             
             a->split = splitSize;
+#if defined(__x86_64__) && defined(__clang__)
+if (debug) printf("evIoctl: split file at %llu (0x%llx) bytes\n", splitSize, splitSize);
+#else
 if (debug) printf("evIoctl: split file at %lu (0x%lx) bytes\n", splitSize, splitSize);
+#endif
             break;
 
         /************************************************/

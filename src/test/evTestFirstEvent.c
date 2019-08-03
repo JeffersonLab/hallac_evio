@@ -116,7 +116,11 @@ int main1()
     printf ("    Changed max events/block to %d, status = %#x\n", maxEvBlk, status);
 
     status = evIoctl(handle, "S", (void *) (&split));
+#ifdef __x86_64__
+    printf ("    Changed split to %llu, status = %#x\n", split, status);
+#else
     printf ("    Changed split to %lu, status = %#x\n", split, status);
+#endif
 
     printf ("    Write dictionary, status = %d\n",status);
     status = evWriteDictionary(handle, dictionary);
